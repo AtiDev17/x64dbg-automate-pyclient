@@ -1590,6 +1590,141 @@ def refresh_gui() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Breakpoint Conditions & Logging
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def set_breakpoint_condition(address: str, condition: str) -> str:
+    """Set a condition on a software breakpoint.
+
+    Args:
+        address: Hex address of the breakpoint
+        condition: x64dbg condition expression (e.g. 'eax == 1')
+    """
+    try:
+        client = _require_client()
+        addr = _parse_address_or_expression(address)
+        result = client.set_breakpoint_condition(addr, condition)
+        return f"Breakpoint condition set at {_format_address(addr)}." if result else "Failed to set condition."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_breakpoint_log(address: str, log_text: str, silent: bool = False) -> str:
+    """Set log text on a software breakpoint.
+
+    Args:
+        address: Hex address of the breakpoint
+        log_text: Text to log when the breakpoint is hit
+        silent: If True, the breakpoint will not break execution
+    """
+    try:
+        client = _require_client()
+        addr = _parse_address_or_expression(address)
+        result = client.set_breakpoint_log(addr, log_text, silent)
+        return f"Breakpoint log set at {_format_address(addr)}." if result else "Failed to set log."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Stack Trace
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_stack_trace() -> str:
+    """Get the current call stack."""
+    try:
+        client = _require_client()
+        frames = client.get_stack_trace()
+        if not frames:
+            return "No stack frames."
+        lines = []
+        for i, frame in enumerate(frames):
+            lines.append(f"#{i} {_format_address(frame.addr)} from {_format_address(frame.from_addr)}  {frame.comment}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Memory Search
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def search_memory(address: str, size: int, pattern: str) -> str:
+    """Search memory for a byte pattern.
+
+    Args:
+        address: Start address to search from
+        size: Number of bytes to search
+        pattern: Hex pattern to search for (e.g. '48 89 5C' or '48895C')
+    """
+    try:
+        client = _require_client()
+        addr = _parse_address_or_expression(address)
+        cleaned = pattern.replace(" ", "").replace("\n", "")
+        pat_bytes = bytes.fromhex(cleaned)
+        results = client.search_memory(addr, size, pat_bytes)
+        if not results:
+            return "Pattern not found."
+        lines = [f"{_format_address(a)}" for a in results[:100]]
+        if len(results) > 100:
+            lines.append(f"... and {len(results) - 100} more")
+        return f"Found {len(results)} match(es):\n" + "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Threads
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_threads() -> str:
+    """List all threads in the debuggee."""
+    try:
+        client = _require_client()
+        threads = client.get_threads()
+        if not threads:
+            return "No threads found."
+        lines = []
+        for t in threads:
+            name = f"  ({t.thread_name})" if t.thread_name else ""
+            lines.append(
+                f"TID: {t.thread_id}  Start: {_format_address(t.start_address)}  "
+                f"LocalBase: {_format_address(t.local_base)}{name}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# String Reading
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def read_string(address: str, max_len: int = 512) -> str:
+    """Read a null-terminated string from debuggee memory.
+
+    Args:
+        address: Hex address to read from
+        max_len: Maximum number of bytes to read
+    """
+    try:
+        client = _require_client()
+        addr = _parse_address_or_expression(address)
+        text = client.read_string_at(addr, max_len)
+        if not text:
+            return f"No string at {_format_address(addr)}."
+        return f"{_format_address(addr)}: \"{text}\""
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

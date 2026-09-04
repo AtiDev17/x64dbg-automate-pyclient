@@ -1,7 +1,8 @@
 import os
 from x64dbg_automate.commands_xauto import XAutoCommandsMixin
 from x64dbg_automate.models import HardwareBreakpointType, MemPage, \
-    MemoryBreakpointType, MutableRegister, PageRightsConfiguration, ReferenceViewRef, StandardBreakpointType
+    MemoryBreakpointType, MutableRegister, PageRightsConfiguration, ReferenceViewRef, \
+    StandardBreakpointType, StackFrame, ThreadInfo
 
 
 class XAutoHighLevelCommandAbstractionMixin(XAutoCommandsMixin):
@@ -839,3 +840,50 @@ class XAutoHighLevelCommandAbstractionMixin(XAutoCommandsMixin):
             text = ref.text.replace('"', '\\"')
             if not self.cmd_sync(f'refadd 0x{ref.address:x}, "{text}"'):
                 return False
+        return True
+
+    def set_breakpoint_condition(self, address_or_symbol: int | str, condition: str) -> bool:
+        """
+        Sets the condition expression for a software breakpoint.
+
+        Args:
+            address_or_symbol: Address or symbol of the breakpoint
+            condition: x64dbg condition expression (e.g. "eax == 1")
+
+        Returns:
+            Success
+        """
+        if isinstance(address_or_symbol, str):
+            val, success = self.eval_sync(address_or_symbol)
+            if not success:
+                raise ValueError(f"Cannot resolve address: {address_or_symbol}")
+            address_or_symbol = val
+        return super().set_breakpoint_condition(address_or_symbol, condition)
+
+    def set_breakpoint_log(self, address_or_symbol: int | str, log_text: str, silent: bool = False) -> bool:
+        """
+        Sets the log text for a software breakpoint.
+
+        Args:
+            address_or_symbol: Address or symbol of the breakpoint
+            log_text: Log text to output when the breakpoint is hit
+            silent: If True, the breakpoint will not break execution
+
+        Returns:
+            Success
+        """
+        if isinstance(address_or_symbol, str):
+            val, success = self.eval_sync(address_or_symbol)
+            if not success:
+                raise ValueError(f"Cannot resolve address: {address_or_symbol}")
+            address_or_symbol = val
+        return super().set_breakpoint_log(address_or_symbol, log_text, silent)
+
+    def get_stack_frames(self) -> list[StackFrame]:
+        """
+        Retrieves the current call stack.
+
+        Returns:
+            A list of StackFrame objects
+        """
+        return super().get_stack_trace()

@@ -418,3 +418,18 @@ class Symbol(BaseModel):
 class ReferenceViewRef(BaseModel):
     address: int
     text: str
+
+
+class StackFrame(BaseModel):
+    addr: int
+    from_addr: int
+    color: str
+    comment: str
+
+
+class ThreadInfo(BaseModel):
+    thread_number: int
+    thread_id: int
+    start_address: int
+    local_base: int
+    thread_name: str

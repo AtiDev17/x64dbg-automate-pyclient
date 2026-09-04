@@ -4,7 +4,7 @@ import time
 from x64dbg_automate.client_base import XAutoClientBase
 from x64dbg_automate.models import Breakpoint, BreakpointType, Context64, Context32, DisasmArgType, \
     DisasmInstrType, Flags, FpuReg, Instruction, InstructionArg, MemPage, MxcsrFields, RegDump32, RegDump64, \
-    SegmentReg, Symbol, SymbolType, X87ControlWordFields, X87Fpu, X87StatusWordFields
+    SegmentReg, StackFrame, Symbol, SymbolType, ThreadInfo, X87ControlWordFields, X87Fpu, X87StatusWordFields  # noqa: F401
 
 
 class XAutoCommand(StrEnum):
@@ -35,6 +35,12 @@ class XAutoCommand(StrEnum):
     XAUTO_REQ_GET_COMMENT = "XAUTO_REQ_GET_COMMENT"
     XAUTO_REQ_GET_SYMBOL = "XAUTO_REQ_GET_SYMBOL"
     XAUTO_REQ_GET_LOG = "XAUTO_REQ_GET_LOG"
+    XAUTO_REQ_SET_BREAKPOINT_CONDITION = "XAUTO_REQ_SET_BREAKPOINT_CONDITION"
+    XAUTO_REQ_SET_BREAKPOINT_LOG = "XAUTO_REQ_SET_BREAKPOINT_LOG"
+    XAUTO_REQ_GET_STACK_TRACE = "XAUTO_REQ_GET_STACK_TRACE"
+    XAUTO_REQ_SEARCH_MEMORY = "XAUTO_REQ_SEARCH_MEMORY"
+    XAUTO_REQ_GET_THREADS = "XAUTO_REQ_GET_THREADS"
+    XAUTO_REQ_READ_STRING = "XAUTO_REQ_READ_STRING"
 
 
 class XAutoCommandsMixin(XAutoClientBase):
@@ -459,6 +465,92 @@ class XAutoCommandsMixin(XAutoClientBase):
         next_index, messages, remaining, evicted = self._send_request(
             XAutoCommand.XAUTO_REQ_GET_LOG, since_index, limit, filter)
         return next_index, messages, remaining, evicted
+
+    def set_breakpoint_condition(self, addr: int, condition: str) -> bool:
+        """
+        Sets the condition expression for a software breakpoint.
+
+        Args:
+            addr: Address of the breakpoint
+            condition: x64dbg condition expression (e.g. "eax == 1")
+
+        Returns:
+            Success
+        """
+        return self._send_request(XAutoCommand.XAUTO_REQ_SET_BREAKPOINT_CONDITION, addr, condition)
+
+    def set_breakpoint_log(self, addr: int, log_text: str, silent: bool = False) -> bool:
+        """
+        Sets the log text for a software breakpoint.
+
+        Args:
+            addr: Address of the breakpoint
+            log_text: Log text to output when the breakpoint is hit
+            silent: If True, the breakpoint will not break execution
+
+        Returns:
+            Success
+        """
+        return self._send_request(XAutoCommand.XAUTO_REQ_SET_BREAKPOINT_LOG, addr, log_text, silent)
+
+    def get_stack_trace(self) -> list[StackFrame]:
+        """
+        Retrieves the current call stack.
+
+        Returns:
+            A list of StackFrame objects
+        """
+        raw_frames = self._send_request(XAutoCommand.XAUTO_REQ_GET_STACK_TRACE)
+        return [StackFrame(
+            addr=frame[0],
+            from_addr=frame[1],
+            color=frame[2],
+            comment=frame[3]
+        ) for frame in raw_frames]
+
+    def search_memory(self, addr: int, size: int, pattern: bytes) -> list[int]:
+        """
+        Searches memory for a byte pattern.
+
+        Args:
+            addr: Start address to search from
+            size: Number of bytes to search
+            pattern: Byte pattern to search for
+
+        Returns:
+            A list of addresses where the pattern was found
+        """
+        return self._send_request(XAutoCommand.XAUTO_REQ_SEARCH_MEMORY, addr, size, pattern)
+
+    def get_threads(self) -> list[ThreadInfo]:
+        """
+        Retrieves the list of threads in the debuggee.
+
+        Returns:
+            A list of ThreadInfo objects
+        """
+        raw_threads = self._send_request(XAutoCommand.XAUTO_REQ_GET_THREADS)
+        return [ThreadInfo(
+            thread_number=thread[0],
+            thread_id=thread[1],
+            start_address=thread[2],
+            local_base=thread[3],
+            thread_name=thread[4]
+        ) for thread in raw_threads]
+
+    def read_string_at(self, addr: int, max_len: int = 512) -> str:
+        """
+        Reads a null-terminated string from the debuggee's memory.
+
+        Args:
+            addr: Address to read from
+            max_len: Maximum length to read
+
+        Returns:
+            The string read from memory, or empty string on failure
+        """
+        success, text = self._send_request(XAutoCommand.XAUTO_REQ_READ_STRING, addr, max_len)
+        return text if success else ""
 
     def wait_until_debugging(self, timeout: int = 10) -> bool:
         """
