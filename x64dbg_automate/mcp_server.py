@@ -487,6 +487,79 @@ def terminate_session() -> str:
         return f"Error: {e}"
 
 
+@mcp.tool()
+def attach(target: str) -> str:
+    """Attach the debugger to a running process for live dynamic analysis.
+
+    Connects to the target process via dbgeng (WinDbg engine). After attaching,
+    use debugger_modules() to see loaded DLLs and debugger_set_breakpoint() to
+    set breakpoints.
+
+    Args:
+        target: Process name (e.g. "Game.exe") or PID.
+    """
+    global _client
+    try:
+        client = _require_client()
+        if isinstance(target, int) or (isinstance(target, str) and target.isdigit()):
+            pid = int(target)
+        else:
+            import subprocess
+            result = subprocess.run(
+                ["tasklist", "/FI", f"IMAGENAME eq {target}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=5,
+            )
+            lines = [line for line in result.stdout.strip().splitlines() if line]
+            if not lines:
+                return f"Process '{target}' not found."
+            pid = int(lines[0].split(",")[1].strip('"'))
+        success = client.attach(pid, wait_timeout=10)
+        return f"Attached to PID {pid}." if success else f"Failed to attach to PID {pid}."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def load_executable(target_exe: str, cmdline: str = "", current_dir: str = "") -> str:
+    """Load a new executable into the debugger.
+
+    Imports the file, opens it in the CodeBrowser, and optionally starts auto-analysis.
+    When analysis is enabled, sends a log notification when analysis completes.
+
+    Args:
+        target_exe: Absolute path to the executable file on disk
+        cmdline: Command-line arguments for the target (optional)
+        current_dir: Working directory for the target (optional)
+    """
+    global _client
+    try:
+        client = _require_client()
+        success = client.load_executable(target_exe, cmdline, current_dir, wait_timeout=10)
+        return f"Loaded {Path(target_exe).name}." if success else f"Failed to load {target_exe}."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def is_process_alive() -> str:
+    """Check if the debuggee process is still running.
+
+    Returns the debuggee PID, run state, and whether it is still alive.
+    Useful for quick status checks after go() or when unsure if the process crashed.
+    """
+    try:
+        client = _require_client()
+        debugging = client.is_debugging()
+        if not debugging:
+            return "No debuggee loaded (process exited or not started)."
+        running = client.is_running()
+        pid = client.debugee_pid()
+        state = "running" if running else "paused/stopped"
+        return f"Debuggee PID {pid} is {state}."
+    except Exception as e:
+        return f"Error: {e}"
+
+
 # ---------------------------------------------------------------------------
 # Debug Control
 # ---------------------------------------------------------------------------
@@ -600,6 +673,31 @@ def run_to_return(frames: int = 1) -> str:
         client = _require_client()
         result = client.ret(frames=frames)
         return "Ran to return." if result else "Run to return failed."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def detach() -> str:
+    """Detach the debugger from the debuggee without killing it.
+
+    The debuggee process continues running normally after detach.
+    """
+    try:
+        client = _require_client()
+        result = client.detach(wait_timeout=10)
+        return "Detached." if result else "Failed to detach."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def terminate_debuggee() -> str:
+    """Kill the debuggee process."""
+    try:
+        client = _require_client()
+        result = client.unload_executable(wait_timeout=5)
+        return "Debuggee terminated." if result else "Failed to terminate debuggee."
     except Exception as e:
         return f"Error: {e}"
 
@@ -1069,6 +1167,125 @@ def execute_command(command: str) -> str:
         return f"Error: {e}"
 
 
+_X64DBG_COMMANDS = {
+    "breakpoint creation": [
+        ("bp addr", "Set software breakpoint at address"),
+        ("bph addr", "Set hardware breakpoint at address"),
+        ("bphc addr", "Set hardware breakpoint on command"),
+        ("bpm addr", "Set memory breakpoint at address"),
+        ("bpd addr", "Set memory breakpoint on data"),
+        ("bp addr, condition", "Set conditional software breakpoint"),
+    ],
+    "breakpoint control": [
+        ("be addr", "Enable breakpoint"),
+        ("bd addr", "Disable breakpoint"),
+        ("bc addr", "Clear/delete breakpoint"),
+        ("bce addr", "Clear all breakpoints"),
+        ("bphwe addr", "Enable hardware breakpoint"),
+        ("bphwd addr", "Disable hardware breakpoint"),
+    ],
+    "breakpoint settings": [
+        ("SetBreakpointCondition addr, expr", "Set condition expression"),
+        ("SetBreakpointLog addr, text", "Set log text"),
+        ("SetBreakpointLogCondition addr, expr", "Set log condition"),
+        ("SetBreakpointCommand addr, cmd", "Set command to execute on hit"),
+        ("SetBreakpointCommandCondition addr, expr", "Set command condition"),
+        ("SetBreakpointSilent addr, 1/0", "Make breakpoint silent (no log window)"),
+        ("SetBreakpointFastResume addr, 1/0", "Skip exception handling on resume"),
+    ],
+    "execution control": [
+        ("run", "Resume execution (F9)"),
+        ("pause", "Pause execution (F12)"),
+        ("singlestep", "Step into one instruction (F7)"),
+        ("stepover", "Step over one instruction (F8)"),
+        ("till addr", "Run until address"),
+        ("ret", "Run until return"),
+        ("skip", "Skip current instruction (NOP)"),
+    ],
+    "register manipulation": [
+        ("r eax=1", "Set EAX to 1"),
+        ("r rax=0x1000", "Set RAX to 0x1000"),
+        ("r eflags|=0x40", "Set zero flag"),
+        ("r eflags&=~0x40", "Clear zero flag"),
+    ],
+    "memory operations": [
+        ("dump addr", "Hex dump at address"),
+        ("db addr", "Dump bytes"),
+        ("dw addr", "Dump words"),
+        ("dd addr", "Dump dwords"),
+        ("dq addr", "Dump qwords"),
+        ("disasm addr", "Disassemble at address"),
+        ("asm addr, instruction", "Assemble instruction at address"),
+        ("fill addr, size, value", "Fill memory with value"),
+        ("memcpy dest, src, size", "Copy memory"),
+        ("strlen addr", "Get null-terminated string length"),
+    ],
+    "search": [
+        ("find addr, data", "Search memory for data"),
+        ("findall addr, data", "Find all occurrences"),
+        ("findasm addr, instruction", "Search for assembly instruction"),
+        ("findmemall addr, data", "Find in all memory regions"),
+    ],
+    "information": [
+        ("modules", "List loaded modules"),
+        ("memmap", "Show memory map"),
+        ("threads", "List threads"),
+        ("handles", "List open handles"),
+        ("log", "Show log messages"),
+        ("stack", "Show stack dump"),
+        ("dump addr expr", "Show address expression"),
+    ],
+    "trace": [
+        ("TraceIntoConditional cond", "Trace into until condition"),
+        ("TraceOverConditional cond", "Trace over until condition"),
+        ("traceenable 1/0", "Enable/disable trace recording"),
+    ],
+    "conditional logging": [
+        ("SetBreakpointLog addr, \"{msg}\"", "Log message on hit"),
+        ("SetBreakpointLog addr, \"{msg} {reg}\"", "Log with register value"),
+        ("SetBreakpointSilent addr, 1", "Log without breaking"),
+    ],
+    "useful patterns": [
+        ("r al=1", "Force auth check to pass (set return value)"),
+        ("r eax=0", "Force function to return 0/success"),
+        ("r eax=1", "Force function to return 1"),
+        ("ret", "Skip current function (return immediately)"),
+        ("skip", "NOP current instruction"),
+        ("jmp addr", "Unconditional jump to address"),
+    ],
+}
+
+
+@mcp.tool()
+def x64dbg_help(category: str = "") -> str:
+    """Reference guide for x64dbg commands.
+
+    Use this to look up the correct command syntax before calling execute_command.
+    Covers breakpoint creation, control, settings, execution control, register
+    manipulation, memory operations, search, tracing, and common patterns.
+
+    Args:
+        category: Optional category filter (e.g. 'breakpoint creation', 'memory operations',
+                  'register manipulation', 'execution control', 'search', 'trace',
+                  'conditional logging', 'useful patterns'). Leave empty for all categories.
+    """
+    if category:
+        cat_lower = category.lower()
+        matches = {k: v for k, v in _X64DBG_COMMANDS.items() if cat_lower in k.lower()}
+        if not matches:
+            available = ", ".join(_X64DBG_COMMANDS.keys())
+            return f"Unknown category '{category}'. Available: {available}"
+    else:
+        matches = _X64DBG_COMMANDS
+
+    lines = []
+    for cat, cmds in matches.items():
+        lines.append(f"\n== {cat.upper()} ==")
+        for cmd, desc in cmds:
+            lines.append(f"  {cmd:50s} {desc}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Breakpoints
 # ---------------------------------------------------------------------------
@@ -1424,6 +1641,28 @@ def switch_thread(tid: int) -> str:
         return f"Error: {e}"
 
 
+@mcp.tool()
+def get_thread_list() -> str:
+    """List all threads in the debuggee.
+
+    Shows thread ID, start address, local base, and name for each thread.
+    """
+    try:
+        client = _require_client()
+        threads = client.get_threads()
+        if not threads:
+            return "No threads found."
+        lines = []
+        for t in threads:
+            lines.append(
+                f"TID: {t.thread_id}  |  Start: 0x{t.start_address:x}  |  "
+                f"LocalBase: 0x{t.local_base:x}  |  Name: {t.thread_name or '(unnamed)'}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
 # ---------------------------------------------------------------------------
 # Events
 # ---------------------------------------------------------------------------
@@ -1460,6 +1699,29 @@ def wait_for_event(event_type: str, timeout: int = 5) -> str:
         event = client.wait_for_debug_event(et, timeout=timeout)
         if event is None:
             return f"Timed out waiting for {event_type}."
+        data_str = ""
+        if event.event_data is not None:
+            data_str = "\n" + "\n".join(
+                f"  {k}: {v}" for k, v in event.event_data.model_dump().items()
+            )
+        return f"Event: {event.event_type}{data_str}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def peek_latest_event() -> str:
+    """Peek at the latest debug event without removing it from the queue.
+
+    Unlike get_latest_event() which pops the event, this lets you check
+    what happened without consuming it. Useful for polling while waiting
+    for a specific condition.
+    """
+    try:
+        client = _require_client()
+        event = client.peek_latest_debug_event()
+        if event is None:
+            return "No events in queue."
         data_str = ""
         if event.event_data is not None:
             data_str = "\n" + "\n".join(
@@ -1624,6 +1886,23 @@ def set_breakpoint_log(address: str, log_text: str, silent: bool = False) -> str
         addr = _parse_address_or_expression(address)
         result = client.set_breakpoint_log(addr, log_text, silent)
         return f"Breakpoint log set at {_format_address(addr)}." if result else "Failed to set log."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_breakpoint_command(address: str, command: str) -> str:
+    """Set a command to execute automatically when a breakpoint is hit.
+
+    Args:
+        address: Hex address of the breakpoint
+        command: x64dbg command to execute on hit (e.g. 'r al=1' to set al to 1)
+    """
+    try:
+        client = _require_client()
+        addr = _parse_address_or_expression(address)
+        result = client.set_breakpoint_command(addr, command)
+        return f"Breakpoint command set at {_format_address(addr)}." if result else "Failed to set command."
     except Exception as e:
         return f"Error: {e}"
 

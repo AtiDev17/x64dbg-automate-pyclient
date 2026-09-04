@@ -879,6 +879,24 @@ class XAutoHighLevelCommandAbstractionMixin(XAutoCommandsMixin):
             address_or_symbol = val
         return super().set_breakpoint_log(address_or_symbol, log_text, silent)
 
+    def set_breakpoint_command(self, address_or_symbol: int | str, command: str) -> bool:
+        """
+        Sets the command to execute when a software breakpoint is hit.
+
+        Args:
+            address_or_symbol: Address or symbol of the breakpoint
+            command: x64dbg command to execute on hit (e.g. 'r al=1')
+
+        Returns:
+            Success
+        """
+        if isinstance(address_or_symbol, str):
+            val, success = self.eval_sync(address_or_symbol)
+            if not success:
+                raise ValueError(f"Cannot resolve address: {address_or_symbol}")
+            address_or_symbol = val
+        return super().set_breakpoint_command(address_or_symbol, command)
+
     def get_stack_frames(self) -> list[StackFrame]:
         """
         Retrieves the current call stack.

@@ -37,6 +37,7 @@ class XAutoCommand(StrEnum):
     XAUTO_REQ_GET_LOG = "XAUTO_REQ_GET_LOG"
     XAUTO_REQ_SET_BREAKPOINT_CONDITION = "XAUTO_REQ_SET_BREAKPOINT_CONDITION"
     XAUTO_REQ_SET_BREAKPOINT_LOG = "XAUTO_REQ_SET_BREAKPOINT_LOG"
+    XAUTO_REQ_SET_BREAKPOINT_COMMAND = "XAUTO_REQ_SET_BREAKPOINT_COMMAND"
     XAUTO_REQ_GET_STACK_TRACE = "XAUTO_REQ_GET_STACK_TRACE"
     XAUTO_REQ_SEARCH_MEMORY = "XAUTO_REQ_SEARCH_MEMORY"
     XAUTO_REQ_GET_THREADS = "XAUTO_REQ_GET_THREADS"
@@ -492,6 +493,19 @@ class XAutoCommandsMixin(XAutoClientBase):
             Success
         """
         return self._send_request(XAutoCommand.XAUTO_REQ_SET_BREAKPOINT_LOG, addr, log_text, silent)
+
+    def set_breakpoint_command(self, addr: int, command: str) -> bool:
+        """
+        Sets the command to execute when a software breakpoint is hit.
+
+        Args:
+            addr: Address of the breakpoint
+            command: x64dbg command to execute on hit (e.g. 'r al=1')
+
+        Returns:
+            Success
+        """
+        return self._send_request(XAutoCommand.XAUTO_REQ_SET_BREAKPOINT_COMMAND, addr, command)
 
     def get_stack_trace(self) -> list[StackFrame]:
         """
