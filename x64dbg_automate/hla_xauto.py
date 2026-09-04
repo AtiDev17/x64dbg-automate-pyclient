@@ -2,7 +2,7 @@ import os
 from x64dbg_automate.commands_xauto import XAutoCommandsMixin
 from x64dbg_automate.models import HardwareBreakpointType, MemPage, \
     MemoryBreakpointType, MutableRegister, PageRightsConfiguration, ReferenceViewRef, \
-    StandardBreakpointType, StackFrame, ThreadInfo
+    StandardBreakpointType, StackFrame
 
 
 class XAutoHighLevelCommandAbstractionMixin(XAutoCommandsMixin):
@@ -75,7 +75,7 @@ class XAutoHighLevelCommandAbstractionMixin(XAutoCommandsMixin):
         Returns:
             True if successful, False otherwise
         """
-        if not self.cmd_sync(f'stop'):
+        if not self.cmd_sync('stop'):
             return False
         return self.wait_until_not_debugging(wait_timeout)
 
@@ -94,7 +94,7 @@ class XAutoHighLevelCommandAbstractionMixin(XAutoCommandsMixin):
         Raises:
             ValueError: If both pass_exceptions and swallow_exceptions are True.
         """
-        if pass_exceptions == True and swallow_exceptions == True:
+        if pass_exceptions and swallow_exceptions:
             raise ValueError("Cannot pass and swallow exceptions at the same time")
         if pass_exceptions:
             prefix = 'e'
@@ -122,7 +122,7 @@ class XAutoHighLevelCommandAbstractionMixin(XAutoCommandsMixin):
         Raises:
             ValueError: If both pass_exceptions and swallow_exceptions are True.
         """
-        if pass_exceptions == True and swallow_exceptions == True:
+        if pass_exceptions and swallow_exceptions:
             raise ValueError("Cannot pass and swallow exceptions at the same time")
         if pass_exceptions:
             prefix = 'e'
@@ -176,7 +176,7 @@ class XAutoHighLevelCommandAbstractionMixin(XAutoCommandsMixin):
         Returns:
             True if successful, False otherwise
         """
-        if pass_exceptions == True and swallow_exceptions == True:
+        if pass_exceptions and swallow_exceptions:
             raise ValueError("Cannot pass and swallow exceptions at the same time")
         if pass_exceptions:
             prefix = 'e'
@@ -314,7 +314,7 @@ class XAutoHighLevelCommandAbstractionMixin(XAutoCommandsMixin):
         Returns:
             True if successful, False otherwise
         """
-        if not self.cmd_sync(f"pause"):
+        if not self.cmd_sync("pause"):
             return False
         return self.wait_until_stopped()
     
@@ -545,7 +545,7 @@ class XAutoHighLevelCommandAbstractionMixin(XAutoCommandsMixin):
         Returns:
             Success
         """
-        return self.cmd_sync(f'hide')
+        return self.cmd_sync('hide')
 
     def debugee_pid(self) -> int | None:
         """
@@ -555,7 +555,7 @@ class XAutoHighLevelCommandAbstractionMixin(XAutoCommandsMixin):
             PID of the debugee, or None if the debugger is not debugging
         """
         if self.is_debugging():
-            pid, res = self.eval_sync(f'pid')
+            pid, res = self.eval_sync('pid')
             if res:
                 return pid
         return None

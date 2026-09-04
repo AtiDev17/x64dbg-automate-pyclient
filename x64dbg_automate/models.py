@@ -71,10 +71,10 @@ class X87StatusWordFields(BaseModel):
     SF: bool
     P: bool
     U: bool
-    O: bool
+    O: bool  # noqa: E741
     Z: bool
     D: bool
-    I: bool
+    I: bool  # noqa: E741
     TOP: int
 
 
