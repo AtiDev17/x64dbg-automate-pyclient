@@ -279,6 +279,35 @@ def mock_client():
     mcp_mod._client = original
 
 
+def _minimal_regdump():
+    """Minimal but fully-valid RegDump64 for register-rendering assertions."""
+    ctx = Context64(
+        rax=1, rbx=2, rcx=3, rdx=4, rbp=5, rsp=6, rsi=7, rdi=8,
+        r8=9, r9=10, r10=11, r11=12, r12=13, r13=14, r14=15, r15=16,
+        rip=0x401000, eflags=0x246, cs=0x33, ds=0x2B, es=0x2B, fs=0x53, gs=0x2B, ss=0x2B,
+        dr0=0, dr1=0, dr2=0, dr3=0, dr6=0, dr7=0,
+        reg_area=b"\x00" * 80,
+        x87_fpu=X87Fpu(ControlWord=0, StatusWord=0, TagWord=0, ErrorOffset=0,
+                       ErrorSelector=0, DataOffset=0, DataSelector=0, Cr0NpxState=0),
+        mxcsr=0, zmm_regs=[b"\x00" * 64] * 32,
+    )
+    flags = Flags(c=False, p=True, a=False, z=True, s=False, t=False, i=True, d=False, o=False)
+    fpu = [FpuReg(data=b"\x00" * 10, st_value=0, tag=0)] * 8
+    mxcsr_f = MxcsrFields(FZ=False, PM=False, UM=False, OM=False, ZM=False, IM=False,
+                           DM=False, DAZ=False, PE=False, UE=False, OE=False, ZE=False,
+                           DE=False, IE=False, RC=0)
+    x87sw = X87StatusWordFields(B=False, C3=False, C2=False, C1=False, C0=False,
+                                 ES=False, SF=False, P=False, U=False, O=False,
+                                 Z=False, D=False, I=False, TOP=0)
+    x87cw = X87ControlWordFields(IC=False, IEM=False, PM=False, UM=False, OM=False,
+                                  ZM=False, DM=False, IM=False, RC=0, PC=0)
+    return RegDump64(
+        context=ctx, flags=flags, fpu=fpu, mmx=[0] * 8,
+        mxcsr_fields=mxcsr_f, x87_status_word_fields=x87sw,
+        x87_control_word_fields=x87cw, last_error=(0, ""), last_status=(0, ""),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Session tool tests
 # ---------------------------------------------------------------------------
@@ -1071,6 +1100,37 @@ class TestSetBreakpoint:
         result = mcp_mod.set_breakpoint("kernel32:CreateFileA")
         assert "set" in result.lower()
 
+    def test_hardware_bp_confirmed(self, mock_client):
+        mock_client.set_hardware_breakpoint.return_value = True
+        hw = Breakpoint(
+            type=BreakpointType.BpHardware, addr=0x401000, enabled=True, singleshoot=False,
+            active=True, name="hw_watch", mod="game.exe", slot=2, typeEx=1, hwSize=4,
+            hitCount=0, fastResume=False, silent=False, breakCondition="", logText="",
+            logCondition="", commandText="", commandCondition="",
+        )
+        mock_client.get_breakpoints.return_value = [hw]
+        result = mcp_mod.set_breakpoint("0x401000", bp_type="hardware", hardware_mode="w",
+                                        hardware_size=4)
+        mock_client.set_hardware_breakpoint.assert_called_once()
+        assert "confirmed (slot 2)" in result
+        assert "size=4" in result
+
+    def test_hardware_bp_unverified_fallback(self, mock_client):
+        mock_client.set_hardware_breakpoint.return_value = True
+        mock_client.get_breakpoints.return_value = []
+        result = mcp_mod.set_breakpoint("0x401000", bp_type="hardware", hardware_mode="x")
+        assert "NOT verified" in result
+
+    def test_hardware_bp_failed(self, mock_client):
+        mock_client.set_hardware_breakpoint.return_value = False
+        result = mcp_mod.set_breakpoint("0x401000", bp_type="hardware")
+        assert "Failed to set hardware" in result
+
+    def test_hardware_bp_invalid_size(self, mock_client):
+        result = mcp_mod.set_breakpoint("0x401000", bp_type="hardware", hardware_size=3)
+        assert "Invalid hardware_size" in result
+        mock_client.set_hardware_breakpoint.assert_not_called()
+
 
 class TestClearBreakpoint:
     def test_clear_all_software(self, mock_client):
@@ -1116,6 +1176,208 @@ class TestListBreakpoints:
         assert "0x401000" in result
         assert "test_bp" in result
         assert "5" in result
+
+
+# ---------------------------------------------------------------------------
+# Hardware breakpoint condition / log / command tool tests (P4)
+# ---------------------------------------------------------------------------
+
+class TestHardwareBpConditionTools:
+    def test_hw_condition_routes_to_bphwcond(self, mock_client):
+        mock_client.set_hardware_breakpoint_condition.return_value = True
+        result = mcp_mod.set_breakpoint_condition("0x401000", "eip == 0x1234",
+                                                  bp_type="hardware")
+        mock_client.set_hardware_breakpoint_condition.assert_called_once_with(
+            0x401000, "eip == 0x1234")
+        assert "condition set" in result
+
+    def test_hw_condition_sw_default_still_software(self, mock_client):
+        mock_client.set_breakpoint_condition.return_value = True
+        result = mcp_mod.set_breakpoint_condition("0x401000", "eax == 1")
+        mock_client.set_breakpoint_condition.assert_called_once_with(0x401000, "eax == 1")
+        assert "condition set" in result
+
+    def test_hw_log(self, mock_client):
+        mock_client.set_hardware_breakpoint_log.return_value = True
+        result = mcp_mod.set_breakpoint_log("0x401000", "{p:cip}", silent=True,
+                                            bp_type="hardware")
+        mock_client.set_hardware_breakpoint_log.assert_called_once_with(
+            0x401000, "{p:cip}", True)
+        assert "log set" in result
+
+    def test_hw_command(self, mock_client):
+        mock_client.set_hardware_breakpoint_command.return_value = True
+        result = mcp_mod.set_breakpoint_command("0x401000", "r al=1", bp_type="hardware")
+        mock_client.set_hardware_breakpoint_command.assert_called_once_with(
+            0x401000, "r al=1")
+        assert "command set" in result
+
+
+# ---------------------------------------------------------------------------
+# run_until tool tests (P5 — no runtocond; temp conditional BP + go + poll)
+# ---------------------------------------------------------------------------
+
+class TestRunUntil:
+    def test_derives_target_from_condition_and_hits(self, mock_client):
+        mock_client.is_debugging.return_value = True
+        mock_client.is_running.return_value = False
+        mock_client.set_breakpoint.return_value = True
+        mock_client.set_breakpoint_condition.return_value = True
+        mock_client.go.return_value = True
+        mock_client.wait_until_stopped.return_value = True
+        mock_client.get_reg.return_value = 0x401000
+        mock_client.get_regs.return_value = _minimal_regdump()
+        result = mcp_mod.run_until("cip == 0x401000")
+        assert "Condition met" in result
+        assert "0x401000" in result
+        mock_client.set_breakpoint.assert_called_once_with(
+            0x401000, name="mcp_run_until", singleshoot=True)
+        mock_client.clear_breakpoint.assert_called_once_with(0x401000)
+
+    def test_timeout_reports_under_cap(self, mock_client):
+        mock_client.is_debugging.return_value = True
+        mock_client.set_breakpoint.return_value = True
+        mock_client.set_breakpoint_condition.return_value = True
+        mock_client.wait_until_stopped.return_value = False
+        mock_client.get_reg.return_value = 0x77AA
+        result = mcp_mod.run_until("cip == 0xffffff00", timeout=10)
+        assert "TIMEOUT" in result
+        assert "[clamped to 5 s]" in result
+        assert "0x77AA" in result
+
+    def test_cannot_derive_address(self, mock_client):
+        mock_client.is_debugging.return_value = True
+        result = mcp_mod.run_until("eax == 5")
+        assert "cannot derive" in result
+        mock_client.set_breakpoint.assert_not_called()
+
+    def test_arm_failure(self, mock_client):
+        mock_client.is_debugging.return_value = True
+        mock_client.set_breakpoint.return_value = False
+        result = mcp_mod.run_until("eip == 0x401000")
+        assert "failed to arm" in result
+
+    def test_no_debuggee(self, mock_client):
+        mock_client.is_debugging.return_value = False
+        result = mcp_mod.run_until("cip == 0x401000")
+        assert "no debuggee" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# get_modules / enumerate_windows / read_memory_external / hardware slots (P2/P6/P7)
+# ---------------------------------------------------------------------------
+
+class TestGetModules:
+    def test_modules_deduped_with_summed_size(self, mock_client):
+        page_a = MemPage(base_address=0x7FF600000000, allocation_base=0x7FF600000000,
+                         allocation_protect=0x40, partition_id=0, region_size=0x1000,
+                         state=mcp_mod.MEM_COMMIT, protect=0x20, type=mcp_mod.MEM_IMAGE,
+                         info="C:\\Windows\\System32\\ntdll.dll")
+        page_b = MemPage(base_address=0x7FF600001000, allocation_base=0x7FF600000000,
+                         allocation_protect=0x40, partition_id=0, region_size=0x2000,
+                         state=mcp_mod.MEM_COMMIT, protect=0x20, type=mcp_mod.MEM_IMAGE,
+                         info="C:\\Windows\\System32\\ntdll.dll")
+        mock_client.memmap.return_value = [page_a, page_b]
+        result = mcp_mod.get_modules()
+        assert "1 modules" in result
+        assert "ntdll.dll" in result
+        # 0x1000 + 0x2000 = 0x3000 summed for one deduped module
+        assert "0x3000" in result
+
+
+class TestEnumerateWindows:
+    def _fake_win32(self):
+        import types
+
+        def fake_enum_windows(cb, _lparam):
+            cb(0x1122AABB, None)
+            return True
+        fake_enum_windows.argtypes = [lambda c: c]  # identity "callback wrapper"
+        fake = types.SimpleNamespace(
+            EnumWindows=fake_enum_windows,
+            GetWindowThreadProcessId=lambda hwnd, pid_ptr: (setattr(pid_ptr.contents, "value", 1234) or True),
+            GetWindowTextW=lambda hwnd, buf, n: (setattr(buf, "value", "Game - Main Menu") or 14),
+            GetClassNameW=lambda hwnd, buf, n: (
+                setattr(buf, "value", "TEnigmaProtectorLoaderRegistrationForm") or 38),
+            GetWindowRect=lambda hwnd, rect_ptr: (
+                setattr(rect_ptr.contents, "left", 10), setattr(rect_ptr.contents, "top", 20),
+                setattr(rect_ptr.contents, "right", 30), setattr(rect_ptr.contents, "bottom", 40),
+                True),
+        )
+        return fake
+
+    def test_lists_debuggee_windows_as_text(self, mock_client):
+        mock_client.debugee_pid.return_value = 1234
+        with patch.object(mcp_mod, "_win32", self._fake_win32()):
+            result = mcp_mod.enumerate_windows()
+        assert "TEnigmaProtectorLoaderRegistrationForm" in result
+        assert "Game - Main Menu" in result
+        assert "pid=1234" in result
+        assert "(10,20,30,40)" in result
+        assert "0x1122aabb" in result or "0x1122AABB" in result
+
+    def test_no_pid_and_no_debuggee(self, mock_client):
+        mock_client.debugee_pid.return_value = None
+        with patch.object(mcp_mod, "_win32", self._fake_win32()):
+            result = mcp_mod.enumerate_windows()
+        assert "No debuggee pid" in result
+
+    def test_non_windows_error(self, mock_client):
+        with patch.object(mcp_mod, "_win32", None):
+            result = mcp_mod.enumerate_windows(pid=1234)
+        assert "Error" in result
+
+
+class TestReadMemoryExternal:
+    def test_reads_bytes_with_pid_anchor(self, mock_client):
+        fake = MagicMock()
+        fake.read_process_memory.return_value = b"\x41\x42\x43\x44"
+        with patch.object(mcp_mod, "_win32", fake):
+            result = mcp_mod.read_memory_external(12345, "0x401000", size=4)
+        assert "12345 @0x401000 (4 bytes): 41424344" in result
+        fake.read_process_memory.assert_called_once_with(12345, 0x401000, 4)
+
+    def test_invalid_external_address(self, mock_client):
+        with patch.object(mcp_mod, "_win32", MagicMock()):
+            result = mcp_mod.read_memory_external(12345, "not-hex", size=4)
+        assert "Error" in result
+
+    def test_non_windows_error(self, mock_client):
+        with patch.object(mcp_mod, "_win32", None):
+            result = mcp_mod.read_memory_external(12345, "0x401000", size=4)
+        assert "Error" in result
+
+
+class TestHardwareSlots:
+    def test_slots_reported(self, mock_client):
+        hw = Breakpoint(
+            type=BreakpointType.BpHardware, addr=0x404000, enabled=True, singleshoot=False,
+            active=True, name="slot0_watch", mod="game.exe", slot=0, typeEx=1, hwSize=8,
+            hitCount=3, fastResume=False, silent=False, breakCondition="", logText="",
+            logCondition="", commandText="", commandCondition="",
+        )
+        mock_client.get_breakpoints.return_value = [hw]
+        result = mcp_mod.get_hardware_slots()
+        assert "Slot 0: 0x404000" in result
+        assert "size=8" in result
+        assert "Slot 1: free" in result
+        assert "Slot 3: free" in result
+
+
+class TestX64dbgHelpCategories:
+    def test_hardware_breakpoints_category(self):
+        result = mcp_mod.x64dbg_help("hardware breakpoints")
+        assert "bphwcond" in result
+        assert "get_hardware_slots" in result
+
+    def test_timeout_caps_category(self):
+        result = mcp_mod.x64dbg_help("timeout caps")
+        assert "clamped" in result
+        assert "refuses" in result.lower() or "refused" in result.lower()
+
+    def test_breakpoint_creation_shows_hw_size(self):
+        result = mcp_mod.x64dbg_help("breakpoint creation")
+        assert "1/2/4/8" in result
 
 
 # ---------------------------------------------------------------------------
@@ -1251,10 +1513,73 @@ class TestEvents:
         result = mcp_mod.get_latest_event()
         assert "EVENT_BREAKPOINT" in result
 
-    def test_wait_for_event_timeout(self, mock_client):
+    def test_wait_for_event_cap_refused(self, mock_client):
+        result = mcp_mod.wait_for_event("EVENT_BREAKPOINT", timeout=10)
+        assert "Error" in result
+        assert "hard cap" in result
+        mock_client.wait_for_debug_event.assert_not_called()
+
+    def test_wait_for_event_no_debuggee(self, mock_client):
+        mock_client.is_debugging.return_value = False
+        result = mcp_mod.wait_for_event("EVENT_BREAKPOINT", timeout=5)
+        assert "no debuggee" in result.lower()
+
+    def test_wait_for_event_already_queued(self, mock_client):
+        event = MagicMock()
+        event.event_type = EventType.EVENT_BREAKPOINT
+        event.event_data = MagicMock()
+        event.event_data.model_dump.return_value = {"addr": 0x1000, "name": "test"}
+        mock_client.is_debugging.return_value = True
+        mock_client.wait_for_debug_event.return_value = event
+        result = mcp_mod.wait_for_event("EVENT_BREAKPOINT", timeout=5)
+        assert "EVENT_BREAKPOINT" in result
+        # timeout=0 pre-scan must be the first probe — never a full block.
+        assert mock_client.wait_for_debug_event.call_args[1]["timeout"] == 0
+
+    def test_wait_for_event_paused_bails_immediately(self, mock_client):
+        mock_client.is_debugging.return_value = True
         mock_client.wait_for_debug_event.return_value = None
-        result = mcp_mod.wait_for_event("EVENT_BREAKPOINT", timeout=1)
-        assert "Timed out" in result
+        mock_client.is_running.return_value = False
+        result = mcp_mod.wait_for_event("EVENT_BREAKPOINT", timeout=5)
+        assert "NOT WAITING" in result
+        assert "paused" in result
+        # Never entered the poll loop: only the timeout=0 pre-scan ran.
+        assert mock_client.wait_for_debug_event.call_count == 1
+
+    def test_wait_for_event_running_no_progress_bails(self, mock_client):
+        mock_client.is_debugging.return_value = True
+        mock_client.wait_for_debug_event.return_value = None
+        mock_client.is_running.return_value = True
+        with patch.object(mcp_mod, "WAIT_EVENT_NO_PROGRESS_SECONDS", 0.01):
+            result = mcp_mod.wait_for_event("EVENT_BREAKPOINT", timeout=5)
+        assert "STILL RUNNING" in result
+        assert "no EVENT_BREAKPOINT" in result or "no state change" in result
+
+    def test_wait_for_event_stopped_without_event(self, mock_client):
+        mock_client.is_debugging.return_value = True
+        mock_client.wait_for_debug_event.return_value = None
+        mock_client.is_running.side_effect = [True, False]  # running, then stops
+        result = mcp_mod.wait_for_event("EVENT_BREAKPOINT", timeout=5)
+        assert "STOPPED" in result
+
+    def test_wait_for_event_arrives_while_running(self, mock_client):
+        event = MagicMock()
+        event.event_type = EventType.EVENT_BREAKPOINT
+        event.event_data = None
+        mock_client.is_debugging.return_value = True
+        mock_client.wait_for_debug_event.side_effect = [None, event]
+        mock_client.is_running.return_value = True
+        with patch.object(mcp_mod, "WAIT_EVENT_NO_PROGRESS_SECONDS", 0.01):
+            result = mcp_mod.wait_for_event("EVENT_BREAKPOINT", timeout=5)
+        assert "Event: EVENT_BREAKPOINT" in result
+
+    def test_wait_for_event_exited(self, mock_client):
+        mock_client.is_debugging.return_value = True
+        mock_client.wait_for_debug_event.return_value = None
+        mock_client.is_running.side_effect = [True, False]
+        mock_client.is_debugging.side_effect = [True, False]  # first real check, then gone
+        result = mcp_mod.wait_for_event("EVENT_BREAKPOINT", timeout=5)
+        assert "exited" in result.lower() or "Debuggee" in result
 
 
 # ---------------------------------------------------------------------------

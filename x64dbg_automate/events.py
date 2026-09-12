@@ -345,12 +345,29 @@ class DebugEventQueueMixin():
 
         Args:
             event_type: The type of event to wait for
-            timeout: The maximum time to wait for the event in seconds
+            timeout: The maximum time to wait for the event in seconds (hard-capped
+                at 5 — larger values raise ValueError)
 
         Returns:
             DbgEvent | None: The latest event of the specified type, or None if the event did not occur within the timeout.
         """
         q = self._queue_for(event_type)
+        # Hard cap: MCP lanes must never block a full minute against a protected
+        # target (AGENTS.md rule 4). Enforced server-side in mcp_server.py too;
+        # this is defense in depth for any direct library caller.
+        if timeout > 5:
+            raise ValueError(
+                f"wait_for_debug_event timeout {timeout}s exceeds the 5 s hard cap; pass timeout <= 5"
+            )
+        # Scan once even when timeout == 0 so an already-queued event is returned
+        # instantly (the MCP layer pre-scans this way before deciding to wait).
+        for event in list(q):
+            if event.event_type == event_type:
+                try:
+                    q.remove(event)
+                except ValueError:
+                    pass  # already evicted by the cap between snapshot and removal
+                return event
         while timeout > 0:
             # Iterate a snapshot: the SUB thread may append/evict concurrently.
             for event in list(q):

@@ -7,6 +7,18 @@ from x64dbg_automate.models import Breakpoint, BreakpointType, Context64, Contex
     SegmentReg, StackFrame, Symbol, SymbolType, ThreadInfo, X87ControlWordFields, X87Fpu, X87StatusWordFields  # noqa: F401
 
 
+def _quote_x64dbg_arg(text: str) -> str:
+    """Quote a command argument for x64dbg's comma/quote-sensitive parser.
+
+    Always wraps in double quotes so expressions or log text containing commas or
+    spaces (e.g. ``streq(utf8(rax), "hello")``) stay a single argument, and escapes
+    inner quotes per the documented ``\\"`` rule::
+
+        SetHardwareBreakpointCondition 401000, "streq(utf8(rax), \\"hello\\")"
+    """
+    return '"' + str(text).replace('"', '\\"') + '"'
+
+
 class XAutoCommand(StrEnum):
     XAUTO_REQ_DEBUGGER_PID = "XAUTO_REQ_DEBUGGER_PID"
     XAUTO_REQ_COMPAT_VERSION = "XAUTO_REQ_COMPAT_VERSION"
@@ -506,6 +518,55 @@ class XAutoCommandsMixin(XAutoClientBase):
             Success
         """
         return self._send_request(XAutoCommand.XAUTO_REQ_SET_BREAKPOINT_COMMAND, addr, command)
+
+    def set_hardware_breakpoint_condition(self, addr: int, condition: str) -> bool:
+        """
+        Sets the condition expression for a hardware breakpoint.
+
+        Uses x64dbg's SetHardwareBreakpointCondition/bphwcond — no software
+        breakpoint is involved, so it keeps working on pages where a software BP
+        would be wiped or detected (e.g. PAGECRYPT-protected regions).
+
+        Args:
+            addr: Address of the hardware breakpoint
+            condition: x64dbg condition expression (e.g. '[0x76C30000] == 0x232')
+
+        Returns:
+            Success
+        """
+        return self.cmd_sync(f'bphwcond 0x{addr:x}, {_quote_x64dbg_arg(condition)}')
+
+    def set_hardware_breakpoint_log(self, addr: int, log_text: str, silent: bool = False) -> bool:
+        """
+        Sets the log text for a hardware breakpoint (SetHardwareBreakpointLog/bphwlog).
+
+        Args:
+            addr: Address of the hardware breakpoint
+            log_text: Log format string to output when the breakpoint is hit
+            silent: If True, the hardware breakpoint will not break execution
+                (SetHardwareBreakpointSilent)
+
+        Returns:
+            Success
+        """
+        ok = self.cmd_sync(f'bphwlog 0x{addr:x}, {_quote_x64dbg_arg(log_text)}')
+        if ok and silent:
+            ok = self.cmd_sync(f'SetHardwareBreakpointSilent 0x{addr:x}, 1')
+        return ok
+
+    def set_hardware_breakpoint_command(self, addr: int, command: str) -> bool:
+        """
+        Sets the command to execute when a hardware breakpoint is hit
+        (SetHardwareBreakpointCommand — no software BP involved).
+
+        Args:
+            addr: Address of the hardware breakpoint
+            command: x64dbg command to execute on hit (e.g. 'r al=1')
+
+        Returns:
+            Success
+        """
+        return self.cmd_sync(f'SetHardwareBreakpointCommand 0x{addr:x}, {_quote_x64dbg_arg(command)}')
 
     def get_stack_trace(self) -> list[StackFrame]:
         """

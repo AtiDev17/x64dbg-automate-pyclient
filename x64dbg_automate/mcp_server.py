@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import base64
+import ctypes
 import json
 import os
 import struct
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -30,6 +32,13 @@ from x64dbg_automate.models import (
     PAGE_GUARD,
 )
 
+try:
+    # Windows-only bindings (ctypes.windll). Imported lazily-safe: on non-Windows
+    # platforms every tool that needs them reports a clear error.
+    from x64dbg_automate import win32 as _win32
+except Exception:  # pragma: no cover - non-Windows import guard
+    _win32 = None
+
 mcp = FastMCP(
     "x64dbg-automate",
     instructions=(
@@ -38,7 +47,10 @@ mcp = FastMCP(
         "Addresses are hex strings (e.g. '0x7FF6A0001000'). Memory reads return hex dumps "
         "by default; pass format='hex' or 'base64' for compact output and a larger "
         "per-call limit, size=0 to read as much as fits, and read_memory_many to batch "
-        "scattered struct-field reads."
+        "scattered struct-field reads. "
+        "ALL debugger waits are hard-capped at 5 seconds: trace_into/trace_over/run_until "
+        "clamp larger wait_timeout values (and tag the result '[clamped to 5 s]'), and "
+        "wait_for_event refuses timeout > 5 — see x64dbg_help('timeout caps')."
     ),
 )
 
@@ -107,6 +119,16 @@ MAX_RESPONSE_CHARS = int(os.getenv("X64DBG_MCP_MAX_RESPONSE_CHARS", "48000"))
 # Held back from a batch's budget so read_memory_many's closing summary and
 # no-debuggee suffix always fit.
 _BATCH_TAIL_RESERVE = 256
+
+# Hard cap on every debugger wait, per AGENTS.md rule 4. Larger values are clamped
+# (trace_into/trace_over/run_until) or refused (wait_for_event) — never honored.
+MAX_DEBUGGER_WAIT_SECONDS = 5
+
+# wait_for_event's no-progress horizon: if the debuggee stays running with zero
+# events and zero state change for this long, the tool bails with a status message
+# instead of draining the whole timeout on a silent/looping target (rule 5: "bail on
+# the first empty/unchanged result"). Lanes re-poll and classify the stage.
+WAIT_EVENT_NO_PROGRESS_SECONDS = 1.0
 
 NO_DEBUGGEE_MSG = (
     "No debuggee: nothing is attached (not started, or exited/terminated). "
@@ -288,6 +310,36 @@ def _encode_memory(data: bytes, addr: int, format: str) -> str:
     if format == "base64":
         return base64.b64encode(data).decode("ascii")
     raise ValueError(f"Invalid format '{format}': expected 'dump', 'hex', or 'base64'")
+
+
+def _render_registers(client) -> str:
+    """Render the full general-purpose register dump + flags as text."""
+    regs = client.get_regs()
+    ctx = regs.context
+    lines = []
+    for field_name in type(ctx).model_fields:
+        val = getattr(ctx, field_name)
+        if isinstance(val, int):
+            lines.append(f"{field_name:8s} = {_format_address(val)}")
+    flags = regs.flags
+    flag_strs = [f"{k}={int(v)}" for k, v in flags.model_dump().items()]
+    lines.append(f"flags    = {' '.join(flag_strs)}")
+    return "\n".join(lines)
+
+
+def _parse_external_address(s: str) -> int:
+    """Parse a plain hex address for processes outside the debugger session.
+
+    External reads (read_memory_external) have no x64dbg expression evaluator to
+    resolve registers or symbols against, so only hex literals are accepted.
+    """
+    s = s.strip()
+    try:
+        return int(s, 16)
+    except ValueError:
+        raise ValueError(
+            f"Cannot parse external address '{s}': expected a hex literal (e.g. '0x401000')"
+        )
 
 
 def _pe_bitness(exe_path: str) -> int:
@@ -492,8 +544,8 @@ def attach(target: str) -> str:
     """Attach the debugger to a running process for live dynamic analysis.
 
     Connects to the target process via dbgeng (WinDbg engine). After attaching,
-    use debugger_modules() to see loaded DLLs and debugger_set_breakpoint() to
-    set breakpoints.
+    use get_memory_map() to see loaded DLLs, set_breakpoint() to set breakpoints,
+    and get_debugger_status() to confirm the attach (pid, bitness, run state).
 
     Args:
         target: Process name (e.g. "Game.exe") or PID.
@@ -713,7 +765,7 @@ def trace_into(
     log_file: str | None = None,
     pass_exceptions: bool = False,
     swallow_exceptions: bool = False,
-    wait_timeout: int = 60,
+    wait_timeout: int = 5,
 ) -> str:
     """Trace into (single-step into calls) until a condition is met.
 
@@ -730,10 +782,13 @@ def trace_into(
         log_file: Path to redirect trace log output to a file
         pass_exceptions: Pass exceptions to the debuggee
         swallow_exceptions: Swallow exceptions
-        wait_timeout: Max seconds to wait for trace completion
+        wait_timeout: Max seconds to wait for trace completion (hard-capped at 5)
     """
     try:
         client = _require_client()
+        clamped = wait_timeout > MAX_DEBUGGER_WAIT_SECONDS
+        if clamped:
+            wait_timeout = MAX_DEBUGGER_WAIT_SECONDS
         result = client.trace_into(
             break_condition=break_condition,
             max_steps=max_steps,
@@ -746,7 +801,8 @@ def trace_into(
             swallow_exceptions=swallow_exceptions,
             wait_timeout=wait_timeout,
         )
-        return "Trace into completed." if result else "Trace into failed."
+        msg = "Trace into completed." if result else "Trace into failed."
+        return f"{msg} [clamped to 5 s]" if clamped else msg
     except Exception as e:
         return f"Error: {e}"
 
@@ -762,7 +818,7 @@ def trace_over(
     log_file: str | None = None,
     pass_exceptions: bool = False,
     swallow_exceptions: bool = False,
-    wait_timeout: int = 60,
+    wait_timeout: int = 5,
 ) -> str:
     """Trace over (single-step over calls) until a condition is met.
 
@@ -779,10 +835,13 @@ def trace_over(
         log_file: Path to redirect trace log output to a file
         pass_exceptions: Pass exceptions to the debuggee
         swallow_exceptions: Swallow exceptions
-        wait_timeout: Max seconds to wait for trace completion
+        wait_timeout: Max seconds to wait for trace completion (hard-capped at 5)
     """
     try:
         client = _require_client()
+        clamped = wait_timeout > MAX_DEBUGGER_WAIT_SECONDS
+        if clamped:
+            wait_timeout = MAX_DEBUGGER_WAIT_SECONDS
         result = client.trace_over(
             break_condition=break_condition,
             max_steps=max_steps,
@@ -795,7 +854,101 @@ def trace_over(
             swallow_exceptions=swallow_exceptions,
             wait_timeout=wait_timeout,
         )
-        return "Trace over completed." if result else "Trace over failed."
+        msg = "Trace over completed." if result else "Trace over failed."
+        return f"{msg} [clamped to 5 s]" if clamped else msg
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def run_until(condition: str, address: str = "", timeout: int = 5) -> str:
+    """Run at full speed until a condition holds, then return regs.
+
+    Fast alternative to trace_into for far targets: x64dbg has no 'runtocond'
+    command, so this arms a temporary conditional breakpoint and runs until it
+    fires (or the timeout elapses). The temporary breakpoint is removed either way.
+
+    The condition is only ever evaluated at the target address — that is how
+    x64dbg break conditions work — so the design expects a condition of the form
+    'cip == 0x401000' (which also supplies the address). If the address can't be
+    derived from the condition, pass it explicitly via `address`.
+
+    Args:
+        condition: x64dbg expression that stops the run when non-zero, evaluated
+            when the target is reached (e.g. 'cip == 0x401000', '[0x76C30000] == 0x232')
+        address: Optional target address where the condition is evaluated. Derived
+            automatically from 'cip == <hex>' / 'eip == <hex>' or a bare hex condition.
+        timeout: Max seconds to wait (hard-capped at 5). A condition that never
+            becomes true returns TIMEOUT under the cap — never hangs.
+
+    Returns:
+        On hit: 'Condition met: cip == 0x...' plus the full register snapshot.
+        On timeout: 'TIMEOUT: condition not met within N s' plus the current cip.
+    """
+    try:
+        client = _require_client()
+        if not client.is_debugging():
+            return NO_DEBUGGEE_MSG
+        clamped = timeout > MAX_DEBUGGER_WAIT_SECONDS
+        if clamped:
+            timeout = MAX_DEBUGGER_WAIT_SECONDS
+
+        # Derive the target address: explicit > 'cip/eip == 0x...' > bare hex.
+        target: int | None = None
+        if address.strip():
+            target = _parse_address_or_expression(address)
+        else:
+            import re
+            m = re.search(r"(?:cip|eip)\s*==\s*(0x[0-9a-fA-F]+)", condition)
+            if m:
+                target = int(m.group(1), 16)
+            else:
+                bare = condition.strip()
+                if re.fullmatch(r"0x[0-9a-fA-F]+", bare):
+                    target = int(bare, 16)
+        if target is None:
+            return (
+                f"Error: cannot derive a target address from condition '{condition}'. "
+                "Pass address=<hex> explicitly, or use a 'cip == 0x...' style condition."
+            )
+
+        # Arm a single-shot conditional breakpoint, run, then poll for the stop.
+        if not client.set_breakpoint(target, name="mcp_run_until", singleshoot=True):
+            return f"Error: failed to arm temporary breakpoint at {_format_address(target)}."
+        if not client.set_breakpoint_condition(target, condition):
+            client.clear_breakpoint(target)
+            return f"Error: failed to set condition '{condition}' on the temporary breakpoint."
+        try:
+            client.go()
+            stopped = client.wait_until_stopped(timeout)
+            if not stopped:
+                cur = 0
+                try:
+                    cur = client.get_reg("cip")
+                except Exception:
+                    pass
+                tag = " [clamped to 5 s]" if clamped else ""
+                return (
+                    f"TIMEOUT: condition never became true within {timeout}s{tag}. "
+                    f"Current cip = {_format_address(cur)}."
+                )
+            if not client.is_debugging():
+                return "Debuggee exited before the condition became true."
+            cur = client.get_reg("cip")
+            hit = cur == target
+            head = (
+                f"Condition met: cip == {_format_address(target)}"
+                if hit else
+                f"Stopped at cip == {_format_address(cur)} (condition not qualified "
+                f"to the target — the temporary breakpoint fired on the address)"
+            )
+            tag = " [clamped to 5 s]" if clamped else ""
+            return f"{head}{tag}\n{_render_registers(client)}"
+        finally:
+            try:
+                client.clear_breakpoint(target)
+            except Exception:
+                pass
     except Exception as e:
         return f"Error: {e}"
 
@@ -1069,6 +1222,146 @@ def get_memory_map(
         return f"Error: {e}"
 
 
+@mcp.tool()
+def get_modules() -> str:
+    """List loaded modules (image regions) with base address and total size.
+
+    Wraps the raw x64dbg 'modules' command. Built from get_memory_map's image
+    regions: each module's size is the sum of its contiguous image regions, so
+    the listing stays a single coherent table.
+
+    Returns:
+        One line per module: '<base>  Size: <size>  <name>'.
+    """
+    try:
+        client = _require_client()
+        pages = [p for p in client.memmap() if p.type == MEM_IMAGE]
+        if not pages:
+            return "No modules (no image regions found)."
+        modules: dict[str, tuple[int, int]] = {}  # name -> (first base, total size)
+        for p in sorted(pages, key=lambda p: p.base_address):
+            name = p.info or f"image_{_format_address(p.base_address)}"
+            if name in modules:
+                base, size = modules[name]
+                modules[name] = (base, size + p.region_size)
+            else:
+                modules[name] = (p.base_address, p.region_size)
+        lines = [
+            f"{_format_address(base)}  Size: {_format_address(size):>12s}  {name}"
+            for name, (base, size) in sorted(modules.items(), key=lambda kv: kv[1][0])
+        ]
+        return f"[{len(modules)} modules]\n" + "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Window Stage & External Reads (text-only, non-pausing)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def enumerate_windows(pid: int | None = None, all_top_level: bool = False) -> str:
+    """Enumerate top-level windows and classify the GUI stage — as text.
+
+    Replacement for screenshots: every lane must snapshot window class/title/rect
+    and classify the stage (protector dialog, game window, error dialog) before
+    touching target state. Output matches the Winprobe schema used in lane docs.
+
+    Args:
+        pid: Owner process id to filter windows to. Defaults to the current
+            debuggee pid (from get_debugger_status) — the same anchor a lane
+            would use for external reads.
+        all_top_level: If False (default), only windows owned by the debuggee pid
+            are listed (forms, game windows, error dialogs). If True, every
+            top-level window on the desktop is listed.
+
+    Returns:
+        One line per window: 'hwnd  class  "title"  (left,top,right,bottom)  pid=...'
+    """
+    if _win32 is None:
+        return "Error: window enumeration requires Windows (x64dbg-automate win32 bindings)."
+    try:
+        client = _require_client()
+        if pid is None:
+            pid = client.debugee_pid()
+            if pid is None:
+                return (
+                    "No debuggee pid to scope windows to. Pass pid=<int> explicitly "
+                    "or set all_top_level=True."
+                )
+
+        found: list[tuple[int, str, str, int, int, int, int, int]] = []
+
+        def callback(hwnd, _lparam):
+            owner_pid = ctypes.c_ulong(0)
+            owner_pid_p = ctypes.cast(ctypes.byref(owner_pid), ctypes.POINTER(ctypes.c_ulong))
+            _win32.GetWindowThreadProcessId(hwnd, owner_pid_p)
+            owner = owner_pid.value
+            if not all_top_level and owner != pid:
+                return True
+            title_buf = ctypes.create_unicode_buffer(512)
+            _win32.GetWindowTextW(hwnd, title_buf, 512)
+            class_buf = ctypes.create_unicode_buffer(256)
+            _win32.GetClassNameW(hwnd, class_buf, 256)
+            rect = ctypes.wintypes.RECT()
+            rect_p = ctypes.cast(ctypes.byref(rect), ctypes.POINTER(ctypes.wintypes.RECT))
+            _win32.GetWindowRect(hwnd, rect_p)
+            found.append((hwnd, class_buf.value, title_buf.value,
+                          rect.left, rect.top, rect.right, rect.bottom, owner))
+            return True
+
+        cb = _win32.EnumWindows.argtypes[0](callback)
+        _win32.EnumWindows(cb, None)
+        if not found:
+            return f"No windows owned by pid {pid}."
+        lines = [
+            f"{hwnd:#x}  {cls}  \"{title}\"  ({l},{t},{r},{b})  pid={owner}"
+            for hwnd, cls, title, l, t, r, b, owner in found
+        ]
+        scope = "all top-level" if all_top_level else f"owned by pid {pid}"
+        return f"[{len(lines)} windows ({scope})]\n" + "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def read_memory_external(pid: int, address: str, size: int = 256, format: str = "hex") -> str:
+    """Read a process's memory WITHOUT pausing it or touching the debuggee.
+
+    Uses a bare OpenProcess + ReadProcessMemory (safe/tamper-invisible: no
+    breakpoints, no debug events, no state change). Use it to sample buffers on a
+    running/protected target, or any separate process.
+
+    **Pid anchoring is mandatory**: the MCP holds ONE shared session, so reads can
+    silently land on another lane's debuggee. This tool reports the pid it acted
+    on in every result and only ever touches the pid you pass.
+
+    Args:
+        pid: Target process id — pass the exact debuggee pid from
+            get_debugger_status (or any process you intend to sample).
+        address: Plain hex address in the target process (no registers/symbols —
+            there is no x64dbg evaluator for foreign processes).
+        size: Number of bytes to request (bounded by the response budget for the
+            format, like read_memory).
+        format: Output encoding per read — 'hex' (default), 'base64', or 'dump'.
+
+    Returns:
+        '<pid> @0x<addr> (<n> bytes): <encoded>' — the resolved pid and the byte
+        count actually read are always reported.
+    """
+    if _win32 is None:
+        return "Error: external reads require Windows (x64dbg-automate win32 bindings)."
+    try:
+        addr = _parse_external_address(address)
+        cap = _max_bytes_for(format, addr)
+        size = min(max(1, size), cap) if size > 0 else cap
+        data = _win32.read_process_memory(pid, addr, size)
+        encoded = _encode_memory(data, addr, format)
+        return f"{pid} @0x{addr:X} ({len(data)} bytes): {encoded}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
 # ---------------------------------------------------------------------------
 # Registers
 # ---------------------------------------------------------------------------
@@ -1110,17 +1403,7 @@ def get_all_registers() -> str:
     """Dump all general-purpose registers and flags."""
     try:
         client = _require_client()
-        regs = client.get_regs()
-        ctx = regs.context
-        lines = []
-        for field_name in type(ctx).model_fields:
-            val = getattr(ctx, field_name)
-            if isinstance(val, int):
-                lines.append(f"{field_name:8s} = {_format_address(val)}")
-        flags = regs.flags
-        flag_strs = [f"{k}={int(v)}" for k, v in flags.model_dump().items()]
-        lines.append(f"flags    = {' '.join(flag_strs)}")
-        return "\n".join(lines)
+        return _render_registers(client)
     except Exception as e:
         return f"Error: {e}"
 
@@ -1170,8 +1453,7 @@ def execute_command(command: str) -> str:
 _X64DBG_COMMANDS = {
     "breakpoint creation": [
         ("bp addr", "Set software breakpoint at address"),
-        ("bph addr", "Set hardware breakpoint at address"),
-        ("bphc addr", "Set hardware breakpoint on command"),
+        ("bph addr, type, size", "Set hardware breakpoint at address (type: r/w/x, size: 1/2/4/8)"),
         ("bpm addr", "Set memory breakpoint at address"),
         ("bpd addr", "Set memory breakpoint on data"),
         ("bp addr, condition", "Set conditional software breakpoint"),
@@ -1180,15 +1462,26 @@ _X64DBG_COMMANDS = {
         ("be addr", "Enable breakpoint"),
         ("bd addr", "Disable breakpoint"),
         ("bc addr", "Clear/delete breakpoint"),
-        ("bce addr", "Clear all breakpoints"),
+        ("bce", "Clear ALL breakpoints (no address argument)"),
         ("bphwe addr", "Enable hardware breakpoint"),
         ("bphwd addr", "Disable hardware breakpoint"),
+        ("bphc [addr]", "Clear hardware breakpoint (no addr = clear all hardware)"),
+    ],
+    "hardware breakpoints": [
+        ("bph addr, type, size", "Arm a debug-register watch (4 slots total; r/w/x; size 1/2/4/8)"),
+        ("bphwcond addr, cond", "Set HARDWARE breakpoint condition (bphwc family) — works on protected pages"),
+        ("bphwlog addr, text", "Set HARDWARE breakpoint log text"),
+        ("SetHardwareBreakpointCommand addr, cmd", "Run cmd when a HARDWARE breakpoint hits"),
+        ("SetHardwareBreakpointSilent addr, 1/0", "Silent flag for a hardware breakpoint (log without breaking)"),
+        ("get_hardware_slots", "MCP tool: which of the 4 debug-register slots are occupied"),
+        ("set_breakpoint(bp_type='hardware', hardware_size=N)", "MCP tool: arm + verify-after-set"),
+        ("set_breakpoint_condition(..., bp_type='hardware')", "MCP tool: hardware condition via bphwcond"),
     ],
     "breakpoint settings": [
-        ("SetBreakpointCondition addr, expr", "Set condition expression"),
-        ("SetBreakpointLog addr, text", "Set log text"),
+        ("SetBreakpointCondition addr, expr", "Set condition expression (software BP)"),
+        ("SetBreakpointLog addr, text", "Set log text (software BP)"),
         ("SetBreakpointLogCondition addr, expr", "Set log condition"),
-        ("SetBreakpointCommand addr, cmd", "Set command to execute on hit"),
+        ("SetBreakpointCommand addr, cmd", "Set command to execute on hit (software BP)"),
         ("SetBreakpointCommandCondition addr, expr", "Set command condition"),
         ("SetBreakpointSilent addr, 1/0", "Make breakpoint silent (no log window)"),
         ("SetBreakpointFastResume addr, 1/0", "Skip exception handling on resume"),
@@ -1201,6 +1494,12 @@ _X64DBG_COMMANDS = {
         ("till addr", "Run until address"),
         ("ret", "Run until return"),
         ("skip", "Skip current instruction (NOP)"),
+    ],
+    "timeout caps": [
+        ("wait_timeout on trace_into/trace_over", "Hard-capped at 5 s; larger values are clamped and tagged '[clamped to 5 s]'"),
+        ("wait_for_event(timeout=N)", "Refuses N > 5 s with an immediate error naming the cap"),
+        ("run_until(condition, timeout=N)", "Capped at 5 s; returns TIMEOUT under the cap, never hangs"),
+        ("MAX_DEBUGGER_WAIT_SECONDS", "Server-wide cap constant (AGENTS.md rule 4)"),
     ],
     "register manipulation": [
         ("r eax=1", "Set EAX to 1"),
@@ -1261,13 +1560,14 @@ def x64dbg_help(category: str = "") -> str:
     """Reference guide for x64dbg commands.
 
     Use this to look up the correct command syntax before calling execute_command.
-    Covers breakpoint creation, control, settings, execution control, register
-    manipulation, memory operations, search, tracing, and common patterns.
+    Covers breakpoint creation, control, settings, hardware breakpoints, execution
+    control, register manipulation, memory operations, search, tracing, timeout
+    caps, and common patterns.
 
     Args:
-        category: Optional category filter (e.g. 'breakpoint creation', 'memory operations',
-                  'register manipulation', 'execution control', 'search', 'trace',
-                  'conditional logging', 'useful patterns'). Leave empty for all categories.
+        category: Optional category filter (e.g. 'breakpoint creation', 'hardware breakpoints',
+                  'timeout caps', 'memory operations', 'register manipulation', 'execution control',
+                  'search', 'trace', 'conditional logging', 'useful patterns'). Leave empty for all categories.
     """
     if category:
         cat_lower = category.lower()
@@ -1296,16 +1596,23 @@ def set_breakpoint(
     bp_type: str = "software",
     name: str | None = None,
     hardware_mode: str = "x",
+    hardware_size: int = 1,
     memory_mode: str = "a",
     singleshot: bool = False,
 ) -> str:
     """Set a breakpoint (software, hardware, or memory).
+
+    Hardware breakpoints are verified after arming: the result reports the actual
+    debug-register arm (slot + size) instead of a bare "Breakpoint set.", so a
+    silent software fallback or exhausted-slot failure is never mistaken for success.
 
     Args:
         address_or_symbol: Hex address or symbol name
         bp_type: 'software', 'hardware', or 'memory'
         name: Optional breakpoint name (software only)
         hardware_mode: Hardware BP mode: 'r' (read), 'w' (write), 'x' (execute)
+        hardware_size: Hardware BP watch size, one of 1, 2, 4, 8 bytes (e.g. 4 to
+            watch a full dword; 8 for a qword). Only with bp_type='hardware'.
         memory_mode: Memory BP mode: 'r', 'w', 'x', 'a' (access)
         singleshot: Single-shot breakpoint
     """
@@ -1318,8 +1625,39 @@ def set_breakpoint(
             addr = address_or_symbol
 
         if bp_type == "hardware":
+            if hardware_size not in (1, 2, 4, 8):
+                raise ValueError(
+                    f"Invalid hardware_size {hardware_size}: expected 1, 2, 4, or 8 bytes"
+                )
             hw = HardwareBreakpointType(hardware_mode)
-            result = client.set_hardware_breakpoint(addr, bp_type=hw)
+            result = client.set_hardware_breakpoint(addr, bp_type=hw, size=hardware_size)
+            if not result:
+                return (
+                    f"Failed to set hardware BP at {address_or_symbol} [{hardware_mode}] — "
+                    "all 4 debug slots may be exhausted or the address is unsupported."
+                )
+            # Verify-after-set: report the ACTUAL arm so a SW fallback or lost slot
+            # is visible instead of a bare success.
+            try:
+                hw_bps = client.get_breakpoints(BreakpointType.BpHardware)
+            except Exception:
+                hw_bps = []
+            match_target = addr if isinstance(addr, int) else None
+            hit = None
+            for bp in hw_bps or []:
+                if bp.enabled and (match_target is None or bp.addr == match_target):
+                    hit = bp
+                    break
+            if hit is not None:
+                return (
+                    f"Hardware BP set at {_format_address(hit.addr)} [{hardware_mode}] "
+                    f"size={hit.hwSize} confirmed (slot {hit.slot})"
+                )
+            return (
+                f"Hardware BP set at {address_or_symbol} [{hardware_mode}] size={hardware_size} "
+                "but NOT verified — no enabled hardware breakpoint listed at that address "
+                "(may have fallen back to a software BP)."
+            )
         elif bp_type == "memory":
             mm = MemoryBreakpointType(memory_mode)
             result = client.set_memory_breakpoint(addr, bp_type=mm, singleshoot=singleshot)
@@ -1412,10 +1750,50 @@ def list_breakpoints(bp_type: str = "software") -> str:
         lines = []
         for bp in bps:
             status = "ON" if bp.enabled else "OFF"
+            extra = f"  Slot: {bp.slot}  Size: {bp.hwSize}" if bt == BreakpointType.BpHardware else ""
             lines.append(
                 f"{_format_address(bp.addr)}  [{status}]  Name: {bp.name}  "
-                f"Module: {bp.mod}  Hits: {bp.hitCount}  Singleshot: {bp.singleshoot}"
+                f"Module: {bp.mod}  Hits: {bp.hitCount}  Singleshot: {bp.singleshoot}{extra}"
             )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_hardware_slots() -> str:
+    """Report which of the 4 debug-register slots are occupied (and by what).
+
+    Diagnoses hardware-breakpoint exhaustion at a glance: x64dbg only has 4 DRx
+    slots, and set_breakpoint(bp_type='hardware') fails or falls back when they
+    are full. Run this before arming a watch if slots may already be taken.
+
+    Returns:
+        One line per slot 0-3: '<slot>: <address> mode=<r/w/x> size=<N> name=<N>'
+        or '<slot>: free'. Also lists any reported hardware BPs without a valid slot.
+    """
+    try:
+        client = _require_client()
+        bps = client.get_breakpoints(BreakpointType.BpHardware) or []
+        occupied: dict[int, object] = {}
+        extras = []
+        for bp in bps:
+            if bp.enabled and bp.slot >= 0 and bp.slot < 4:
+                occupied.setdefault(bp.slot, bp)
+            else:
+                extras.append(bp)
+        lines = ["Hardware breakpoint slots (4 total):"]
+        for slot in range(4):
+            bp = occupied.get(slot)
+            if bp is None:
+                lines.append(f"  Slot {slot}: free")
+            else:
+                lines.append(
+                    f"  Slot {slot}: {_format_address(bp.addr)} size={bp.hwSize} "
+                    f"name={bp.name or '-'}"
+                )
+        if extras:
+            lines.append("[note: %d hardware BP(s) reported without a valid slot]" % len(extras))
         return "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
@@ -1687,24 +2065,89 @@ def get_latest_event() -> str:
 
 @mcp.tool()
 def wait_for_event(event_type: str, timeout: int = 5) -> str:
-    """Wait for a specific debug event type.
+    """Wait for a specific debug event type — state-aware, never blocks on a silent target.
+
+    This is a SHORT poll probe, not a long block. It returns on the first cycle
+    where the debugger state says nothing can (or will) arrive:
+
+    * Already-queued event            -> returned instantly;
+    * Debuggee paused/stopped/idle    -> 'NOT WAITING: paused...' (events only fire
+      while running — classify the stage instead of blocking, AGENTS.md rule 5);
+    * Running, no event, no state     -> 'STILL RUNNING: no <EVENT> in ~1 s...' (loop
+      change for ~1 s                  or bp never reached): re-poll or classify;
+    * Debuggee stops, no event queued -> 'STOPPED...' (other stop reason / bp wiped).
+
+    The full timeout is only ever consumed while the debugger is actively running,
+    and even then the no-progress bail fires after ~1 s of silence. This is what
+    prevents the classic hang: `go()` on a target that never hits the breakpoint
+    (or is sitting at a form) no longer burns the entire timeout for nothing.
+
+    Hard-capped: timeout > 5 s is refused immediately (never honored).
 
     Args:
         event_type: Event type name (e.g. 'EVENT_BREAKPOINT', 'EVENT_LOAD_DLL')
-        timeout: Max seconds to wait
+        timeout: Max seconds to wait (must be <= 5)
     """
     try:
+        if timeout > MAX_DEBUGGER_WAIT_SECONDS:
+            raise ValueError(
+                f"wait_for_event timeout {timeout}s exceeds the {MAX_DEBUGGER_WAIT_SECONDS} s "
+                f"hard cap (AGENTS.md rule 4). Pass timeout <= {MAX_DEBUGGER_WAIT_SECONDS}."
+            )
         client = _require_client()
         et = EventType(event_type)
-        event = client.wait_for_debug_event(et, timeout=timeout)
-        if event is None:
-            return f"Timed out waiting for {event_type}."
-        data_str = ""
-        if event.event_data is not None:
-            data_str = "\n" + "\n".join(
-                f"  {k}: {v}" for k, v in event.event_data.model_dump().items()
+
+        if not client.is_debugging():
+            return NO_DEBUGGEE_MSG
+
+        def _fmt(event) -> str:
+            data_str = ""
+            if event.event_data is not None:
+                data_str = "\n" + "\n".join(
+                    f"  {k}: {v}" for k, v in event.event_data.model_dump().items()
+                )
+            return f"Event: {event.event_type}{data_str}"
+
+        # Already-queued event -> return instantly. timeout=0 still scans the queue
+        # once (events.py), so this costs nothing and never blocks.
+        event = client.wait_for_debug_event(et, timeout=0)
+        if event is not None:
+            return _fmt(event)
+
+        # Paused/idle: no debug event can fire until go()/step. Burn nothing.
+        if not client.is_running():
+            return (
+                f"NOT WAITING: debuggee is paused/stopped, so {event_type} can only "
+                "fire after go()/step. Classify the stage via enumerate_windows() or "
+                "get_debugger_status() and decide — never block on a paused target."
             )
-        return f"Event: {event.event_type}{data_str}"
+
+        start = time.monotonic()
+        deadline = start + timeout
+        while time.monotonic() < deadline:
+            event = client.wait_for_debug_event(et, timeout=0.25)
+            if event is not None:
+                return _fmt(event)
+            if not client.is_running():
+                # State changed — the target stopped. One grace tick for the in-flight
+                # SUB event, then report instead of waiting out the cap.
+                event = client.wait_for_debug_event(et, timeout=0.25)
+                if event is not None:
+                    return _fmt(event)
+                if not client.is_debugging():
+                    return "Debuggee exited while waiting; no event arrived."
+                return (
+                    f"STOPPED: debuggee paused but no {event_type} was queued (stopped "
+                    "for another reason, or the breakpoint was wiped). Read "
+                    "get_debugger_status()/enumerate_windows() to classify."
+                )
+            if time.monotonic() - start >= WAIT_EVENT_NO_PROGRESS_SECONDS:
+                return (
+                    f"STILL RUNNING: no {event_type} in ~{WAIT_EVENT_NO_PROGRESS_SECONDS:g} s "
+                    "with no state change (loop, or the breakpoint is never reached). "
+                    "Re-poll, check get_debugger_status()/enumerate_windows(), or re-arm."
+                )
+        return f"Timed out waiting for {event_type} after {timeout}s."
     except Exception as e:
         return f"Error: {e}"
 
@@ -1856,52 +2299,75 @@ def refresh_gui() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def set_breakpoint_condition(address: str, condition: str) -> str:
-    """Set a condition on a software breakpoint.
+def set_breakpoint_condition(address: str, condition: str, bp_type: str = "software") -> str:
+    """Set a condition on a breakpoint.
+
+    With bp_type='hardware' this uses x64dbg's bphwcond (SetHardwareBreakpointCondition)
+    — no software breakpoint involved, so it works on pages where a SW BP would be
+    wiped or detected (e.g. PAGECRYPT-protected regions).
 
     Args:
         address: Hex address of the breakpoint
-        condition: x64dbg condition expression (e.g. 'eax == 1')
+        condition: x64dbg condition expression (e.g. 'eax == 1', '[0x76C30000] == 0x232')
+        bp_type: 'software' (default) or 'hardware'
     """
     try:
         client = _require_client()
         addr = _parse_address_or_expression(address)
-        result = client.set_breakpoint_condition(addr, condition)
+        if bp_type == "hardware":
+            result = client.set_hardware_breakpoint_condition(addr, condition)
+        else:
+            result = client.set_breakpoint_condition(addr, condition)
         return f"Breakpoint condition set at {_format_address(addr)}." if result else "Failed to set condition."
     except Exception as e:
         return f"Error: {e}"
 
 
 @mcp.tool()
-def set_breakpoint_log(address: str, log_text: str, silent: bool = False) -> str:
-    """Set log text on a software breakpoint.
+def set_breakpoint_log(address: str, log_text: str, silent: bool = False, bp_type: str = "software") -> str:
+    """Set log text on a breakpoint.
+
+    With bp_type='hardware' this uses x64dbg's bphwlog (SetHardwareBreakpointLog)
+    plus SetHardwareBreakpointSilent when silent=True — no software breakpoint
+    involved, so log-without-breaking works on protected pages too.
 
     Args:
         address: Hex address of the breakpoint
         log_text: Text to log when the breakpoint is hit
         silent: If True, the breakpoint will not break execution
+        bp_type: 'software' (default) or 'hardware'
     """
     try:
         client = _require_client()
         addr = _parse_address_or_expression(address)
-        result = client.set_breakpoint_log(addr, log_text, silent)
+        if bp_type == "hardware":
+            result = client.set_hardware_breakpoint_log(addr, log_text, silent)
+        else:
+            result = client.set_breakpoint_log(addr, log_text, silent)
         return f"Breakpoint log set at {_format_address(addr)}." if result else "Failed to set log."
     except Exception as e:
         return f"Error: {e}"
 
 
 @mcp.tool()
-def set_breakpoint_command(address: str, command: str) -> str:
+def set_breakpoint_command(address: str, command: str, bp_type: str = "software") -> str:
     """Set a command to execute automatically when a breakpoint is hit.
+
+    With bp_type='hardware' this uses x64dbg's SetHardwareBreakpointCommand — no
+    software breakpoint involved, so command-on-hit works on protected pages too.
 
     Args:
         address: Hex address of the breakpoint
         command: x64dbg command to execute on hit (e.g. 'r al=1' to set al to 1)
+        bp_type: 'software' (default) or 'hardware'
     """
     try:
         client = _require_client()
         addr = _parse_address_or_expression(address)
-        result = client.set_breakpoint_command(addr, command)
+        if bp_type == "hardware":
+            result = client.set_hardware_breakpoint_command(addr, command)
+        else:
+            result = client.set_breakpoint_command(addr, command)
         return f"Breakpoint command set at {_format_address(addr)}." if result else "Failed to set command."
     except Exception as e:
         return f"Error: {e}"
