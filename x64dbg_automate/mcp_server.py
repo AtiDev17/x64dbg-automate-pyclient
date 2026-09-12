@@ -130,6 +130,13 @@ MAX_DEBUGGER_WAIT_SECONDS = 5
 # the first empty/unchanged result"). Lanes re-poll and classify the stage.
 WAIT_EVENT_NO_PROGRESS_SECONDS = 1.0
 
+# run_until drains/consumes at most this many queued EVENT_BREAKPOINT events per
+# pass. It is bounded by the client ring-buffer depth (events.py
+# DEFAULT_EVENT_QUEUE_MAXLEN = 100); each wait_for_debug_event(..., timeout=0)
+# call is a single non-blocking queue scan, so the drain itself never blocks and
+# the cap only guards against a live/event-rich debuggee feeding the loop forever.
+RUN_UNTIL_DRAIN_LIMIT = 64
+
 NO_DEBUGGEE_MSG = (
     "No debuggee: nothing is attached (not started, or exited/terminated). "
     "This is not a bad address — use get_debugger_status to confirm."
@@ -229,6 +236,35 @@ def _no_debuggee_hint(client) -> str:
         return "" if client.is_debugging() else f" — {NO_DEBUGGEE_MSG}"
     except Exception:
         return ""
+
+
+# Per-call pid anchoring (N1): the MCP holds ONE shared session across lanes, so an
+# in-debugger read can silently land on another lane's debuggee. Every read reply
+# therefore starts with the pid it acted on, resolved per call from the session
+# anchor — a shared-session flip shows up as a pid mismatch in a single reply with
+# no follow-up get_debugger_status() call. Held back from a single read's payload
+# budget for the '<pid> @0x<addr> (N bytes): ' prefix, mirroring the anchored shape
+# read_memory_external already reports.
+_ANCHOR_TAIL_RESERVE = 24  # ' (12345 bytes): ' worst case + separator
+
+
+def _resolve_anchor_pid(client) -> str:
+    """Resolve the debuggee pid this call acts on, as text, or 'n/a' if none.
+
+    Resolved from the current-session client — the same anchor get_debugger_status
+    reports — never from a caller-supplied value. Never raises and performs no wait,
+    so reads stay instant and inside the 5 s cap.
+    """
+    try:
+        pid = client.debugee_pid()
+        return str(pid) if isinstance(pid, int) else "n/a"
+    except Exception:
+        return "n/a"
+
+
+def _anchor_prefix_len(pid: str, addr: int, max_bytes: int) -> int:
+    """Reserved reply length for the '<pid> @0x<addr> (N bytes): ' anchor prefix."""
+    return len(f"{pid} @{_format_address(addr)} ({max_bytes} bytes): ")
 
 
 def _encoded_len(nbytes: int, addr: int, format: str) -> int:
@@ -860,6 +896,23 @@ def trace_over(
         return f"Error: {e}"
 
 
+def _drain_breakpoint_events(client) -> list:
+    """Consume queued EVENT_BREAKPOINT events from the client event queue.
+
+    Bounded and non-blocking: every `wait_for_debug_event(..., timeout=0)` call
+    performs one queue scan, so this can neither block nor spin — the loop stops
+    on the first empty scan and is capped at RUN_UNTIL_DRAIN_LIMIT either way.
+    Returns the drained events (oldest first) for the caller to classify.
+    """
+    drained = []
+    for _ in range(RUN_UNTIL_DRAIN_LIMIT):
+        ev = client.wait_for_debug_event(EventType.EVENT_BREAKPOINT, timeout=0)
+        if ev is None:
+            break
+        drained.append(ev)
+    return drained
+
+
 @mcp.tool()
 def run_until(condition: str, address: str = "", timeout: int = 5) -> str:
     """Run at full speed until a condition holds, then return regs.
@@ -873,6 +926,12 @@ def run_until(condition: str, address: str = "", timeout: int = 5) -> str:
     'cip == 0x401000' (which also supplies the address). If the address can't be
     derived from the condition, pass it explicitly via `address`.
 
+    Stale-event safe: any EVENT_BREAKPOINT already queued from earlier work is
+    drained BEFORE go() (mirroring wait_for_event's queue pre-scan), so a leftover
+    breakpoint event can never be mistaken for this run's stop. The reply carries
+    a `reason:` line — 'condition_hit' when the run stopped at the target with the
+    condition true, 'breakpoint_event' when a different breakpoint stopped it first.
+
     Args:
         condition: x64dbg expression that stops the run when non-zero, evaluated
             when the target is reached (e.g. 'cip == 0x401000', '[0x76C30000] == 0x232')
@@ -882,7 +941,10 @@ def run_until(condition: str, address: str = "", timeout: int = 5) -> str:
             becomes true returns TIMEOUT under the cap — never hangs.
 
     Returns:
-        On hit: 'Condition met: cip == 0x...' plus the full register snapshot.
+        On hit: 'Condition met: cip == 0x...' plus 'reason: condition_hit' and the
+        full register snapshot.
+        On early stop elsewhere: 'Stopped at cip == 0x...' plus
+        'reason: breakpoint_event' and the register snapshot.
         On timeout: 'TIMEOUT: condition not met within N s' plus the current cip.
     """
     try:
@@ -919,6 +981,12 @@ def run_until(condition: str, address: str = "", timeout: int = 5) -> str:
             client.clear_breakpoint(target)
             return f"Error: failed to set condition '{condition}' on the temporary breakpoint."
         try:
+            # Drain already-queued EVENT_BREAKPOINT events from earlier work BEFORE
+            # go(). Without this, a stale queued breakpoint event can be consumed by
+            # the first wait after go() and mis-report a hit at the wrong cip (or an
+            # unrelated stop). Mirror P1's state-aware wait_for_event, which also
+            # pre-scans the queue. timeout=0 scans once per call — never blocks.
+            _drain_breakpoint_events(client)
             client.go()
             stopped = client.wait_until_stopped(timeout)
             if not stopped:
@@ -935,15 +1003,32 @@ def run_until(condition: str, address: str = "", timeout: int = 5) -> str:
             if not client.is_debugging():
                 return "Debuggee exited before the condition became true."
             cur = client.get_reg("cip")
-            hit = cur == target
-            head = (
-                f"Condition met: cip == {_format_address(target)}"
-                if hit else
-                f"Stopped at cip == {_format_address(cur)} (condition not qualified "
-                f"to the target — the temporary breakpoint fired on the address)"
-            )
+
+            # Consume the post-stop breakpoint event(s) and classify the stop. The
+            # single-shot conditional BP only fires at the target with its condition
+            # true, so stopping at the target IS a genuine condition hit; stopping
+            # anywhere else means a plain breakpoint event (or another stop reason)
+            # fired first. Event metadata names the offending breakpoint when present.
+            events = _drain_breakpoint_events(client)
+            if cur == target:
+                reason = "condition_hit"
+                head = f"Condition met: cip == {_format_address(target)}"
+            else:
+                reason = "breakpoint_event"
+                foreign = next((e for e in events if e.event_data is not None), None)
+                detail = ""
+                if foreign is not None and foreign.event_data is not None:
+                    faddr = getattr(foreign.event_data, "addr", None)
+                    fname = getattr(foreign.event_data, "name", None)
+                    here = _format_address(faddr) if faddr is not None else "?"
+                    detail = f" — '{fname or 'breakpoint'}' at {here}"
+                head = (
+                    f"Stopped at cip == {_format_address(cur)}: a breakpoint event "
+                    f"fired at a different address than the requested target{detail}; "
+                    "the condition was not evaluated."
+                )
             tag = " [clamped to 5 s]" if clamped else ""
-            return f"{head}{tag}\n{_render_registers(client)}"
+            return f"{head}{tag}\nreason: {reason}\n{_render_registers(client)}"
         finally:
             try:
                 client.clear_breakpoint(target)
@@ -961,6 +1046,11 @@ def run_until(condition: str, address: str = "", timeout: int = 5) -> str:
 def read_memory(address: str, size: int = 256, format: str = "dump") -> str:
     """Read memory from the debuggee.
 
+    **Pid anchoring**: the MCP holds ONE shared session, so reads can silently land
+    on another lane's debuggee. Every reply starts with the debuggee pid this read
+    acted on, resolved per call from the session anchor (get_debugger_status) — a
+    shared-session flip shows up as a pid mismatch with no follow-up status call.
+
     Results are never truncated. A read too large to encode is refused before it is
     issued, naming the limit for the chosen format.
 
@@ -972,19 +1062,27 @@ def read_memory(address: str, size: int = 256, format: str = "dump") -> str:
             'dump'   — hex dump with ASCII sidebar (default; human-readable, ~9 KB)
             'hex'    — contiguous uppercase hex, no separators (~24 KB)
             'base64' — most compact, best for bulk reads (~36 KB)
+
+    Returns:
+        '<pid> @0x<addr> (<n> bytes): <encoded>' — the resolved pid and the byte
+        count actually read are always reported.
     """
     try:
         client = _require_client()
+        pid = _resolve_anchor_pid(client)
         addr = _parse_address_or_expression(address)
-        cap = _max_bytes_for(format, addr)
+        cap0 = _max_bytes_for(format, addr)
+        overhead = _anchor_prefix_len(pid, addr, cap0)
+        cap = _max_bytes_for(format, addr, max(0, MAX_RESPONSE_CHARS - overhead))
         if size <= 0:
             # Bounded by the region as well as the budget — see _readable_span.
             span = _readable_span(client, addr)
             size = min(cap, span) if span else cap
-        elif _encoded_len(size, addr, format) > MAX_RESPONSE_CHARS:
+        elif _encoded_len(size, addr, format) + overhead > MAX_RESPONSE_CHARS:
             alt = ""
             if format != "base64":
-                alt = f", or format='base64' to fit {_max_bytes_for('base64', addr):,}"
+                alt_room = _max_bytes_for("base64", addr, max(0, MAX_RESPONSE_CHARS - overhead))
+                alt = f", or format='base64' to fit {alt_room:,}"
             return (
                 f"Error: {size:,} bytes as '{format}' would exceed the response limit. "
                 f"Read at most {cap:,} bytes in this format{alt}. "
@@ -994,7 +1092,7 @@ def read_memory(address: str, size: int = 256, format: str = "dump") -> str:
             data = client.read_memory(addr, size)
         except Exception as e:
             return f"Error: {e}{_no_debuggee_hint(client)}"
-        return _encode_memory(data, addr, format)
+        return f"{pid} @{_format_address(addr)} ({len(data)} bytes): {_encode_memory(data, addr, format)}"
     except Exception as e:
         return f"Error: {e}"
 
@@ -1009,6 +1107,11 @@ def read_memory_many(reads: list[str], format: str = "hex") -> str:
     The batch shares one response budget. A read that does not fit in what remains is
     skipped whole and reported as such — every returned read is complete.
 
+    **Pid anchoring**: the MCP holds ONE shared session, so reads can silently land
+    on another lane's debuggee. Every line starts with the debuggee pid this batch
+    acted on, resolved per call from the session anchor (get_debugger_status) — a
+    shared-session flip shows up as a pid mismatch with no follow-up status call.
+
     Args:
         reads: Ranges as '<address>:<size>' strings, e.g. ['0x1000:16', 'esi+0x10:4'].
                The address accepts the same forms as read_memory. Sizes are literal
@@ -1016,12 +1119,13 @@ def read_memory_many(reads: list[str], format: str = "hex") -> str:
         format: Output encoding per read — 'hex' (default), 'base64', or 'dump'.
 
     Returns:
-        One line per read: '<spec> @<resolved address> = <encoded bytes>',
-        '<spec> ERROR: <reason>' for reads that could not be satisfied, or
-        '<spec> SKIPPED: ...' for reads dropped to stay within the response budget.
+        One line per read: '<pid> <spec> @<resolved address> (<n> bytes): <encoded bytes>',
+        '<pid> <spec> ERROR: <reason>' for reads that could not be satisfied, or
+        '<pid> <spec> SKIPPED: ...' for reads dropped to stay within the response budget.
     """
     try:
         client = _require_client()
+        pid = _resolve_anchor_pid(client)
     except Exception as e:
         return f"Error: {e}"
 
@@ -1040,12 +1144,14 @@ def read_memory_many(reads: list[str], format: str = "hex") -> str:
                 raise ValueError("expected '<address>:<size>'")
             addr = _parse_address_or_expression(addr_part)
             size = max(0, int(size_part, 0))
-            prefix = f"{spec} @{_format_address(addr)} ="
-            overhead = len(prefix) + 2  # separator + newline
+            prefix = f"{pid} {spec} @{_format_address(addr)}"
+            # separator + newline, plus the '(N bytes): ' tail reserved up front so
+            # the line stays inside the budget even when a short read is full length.
+            overhead = len(prefix) + 2 + _ANCHOR_TAIL_RESERVE
             if _encoded_len(size, addr, format) + overhead > budget:
                 room = _max_bytes_for(format, addr, max(0, budget - overhead))
                 note = (
-                    f"{spec} SKIPPED: {size:,} bytes exceeds the remaining response "
+                    f"{pid} {spec} SKIPPED: {size:,} bytes exceeds the remaining response "
                     f"budget (room for {room:,} more bytes). Request it separately."
                 )
                 if len(note) + 1 > budget:
@@ -1057,12 +1163,12 @@ def read_memory_many(reads: list[str], format: str = "hex") -> str:
             data = client.read_memory(addr, size)
             encoded = _encode_memory(data, addr, format)
             separator = "\n" if format == "dump" else " "
-            line = f"{prefix}{separator}{encoded}"
+            line = f"{prefix} ({len(data)} bytes):{separator}{encoded}"
             lines.append(line)
             budget -= len(line) + 1
         except Exception as e:
             failed = True
-            note = f"{spec} ERROR: {e}"
+            note = f"{pid} {spec} ERROR: {e}"
             if len(note) + 1 > budget:
                 lines.append(_batch_exhausted(len(reads) - index))
                 break
@@ -1070,7 +1176,8 @@ def read_memory_many(reads: list[str], format: str = "hex") -> str:
             budget -= len(note) + 1
 
     # Probe for a debuggee once, and only if something failed, so a fully
-    # successful batch costs no extra round trip — same rule as read_memory.
+    # successful batch costs no extra is_debugging round trip. The per-call pid
+    # anchor is resolved once up front regardless — see _resolve_anchor_pid.
     suffix = _no_debuggee_hint(client).lstrip(" —") if failed else ""
     return "\n".join(lines) + (f"\n{suffix}" if suffix else "")
 
@@ -1139,6 +1246,11 @@ def get_memory_map(
 ) -> str:
     """List memory regions in the debuggee's address space, filtered and paginated.
 
+    **Pid anchoring**: the MCP holds ONE shared session, so the region map can
+    silently belong to another lane's debuggee. Every reply starts with the
+    debuggee pid this listing was taken from, resolved per call from the session
+    anchor (get_debugger_status).
+
     Defaults to committed regions only — a full map is typically ~1000 regions and
     too large for a single response. Pass state='' to include reserved and free ones.
 
@@ -1169,13 +1281,15 @@ def get_memory_map(
         if not client.is_debugging():
             return NO_DEBUGGEE_MSG
 
+        pid = _resolve_anchor_pid(client)
+
         want_state = _named_filter_value(state, _STATE_NAMES, "state")
         want_type = _named_filter_value(mem_type, _TYPE_NAMES, "mem_type")
 
         pages = client.memmap()
         total = len(pages)
         if not pages:
-            return "No memory regions found."
+            return f"{pid} No memory regions found."
 
         matched = [
             p for p in pages
@@ -1217,7 +1331,7 @@ def get_memory_map(
         summary = f"[{len(matched)}/{total} regions matched, {total - len(matched)} hidden by filters"
         if remaining > 0:
             summary += f"; {remaining} more — call again with offset={offset + len(window)}"
-        return f"{body}\n{summary}]"
+        return f"{pid} @memory map:\n{body}\n{summary}]"
     except Exception as e:
         return f"Error: {e}"
 
@@ -1225,6 +1339,11 @@ def get_memory_map(
 @mcp.tool()
 def get_modules() -> str:
     """List loaded modules (image regions) with base address and total size.
+
+    **Pid anchoring**: the MCP holds ONE shared session, so the module listing
+    can silently belong to another lane's debuggee. Every reply starts with the
+    debuggee pid this listing was taken from, resolved per call from the session
+    anchor (get_debugger_status).
 
     Wraps the raw x64dbg 'modules' command. Built from get_memory_map's image
     regions: each module's size is the sum of its contiguous image regions, so
@@ -1235,9 +1354,10 @@ def get_modules() -> str:
     """
     try:
         client = _require_client()
+        pid = _resolve_anchor_pid(client)
         pages = [p for p in client.memmap() if p.type == MEM_IMAGE]
         if not pages:
-            return "No modules (no image regions found)."
+            return f"{pid} No modules (no image regions found)."
         modules: dict[str, tuple[int, int]] = {}  # name -> (first base, total size)
         for p in sorted(pages, key=lambda p: p.base_address):
             name = p.info or f"image_{_format_address(p.base_address)}"
@@ -1250,7 +1370,7 @@ def get_modules() -> str:
             f"{_format_address(base)}  Size: {_format_address(size):>12s}  {name}"
             for name, (base, size) in sorted(modules.items(), key=lambda kv: kv[1][0])
         ]
-        return f"[{len(modules)} modules]\n" + "\n".join(lines)
+        return f"{pid} @modules:\n[{len(modules)} modules]\n" + "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
 
@@ -1260,7 +1380,8 @@ def get_modules() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def enumerate_windows(pid: int | None = None, all_top_level: bool = False) -> str:
+def enumerate_windows(pid: int | None = None, all_top_level: bool = False,
+                      visible_only: bool = False, include_children: bool = False) -> str:
     """Enumerate top-level windows and classify the GUI stage — as text.
 
     Replacement for screenshots: every lane must snapshot window class/title/rect
@@ -1274,9 +1395,18 @@ def enumerate_windows(pid: int | None = None, all_top_level: bool = False) -> st
         all_top_level: If False (default), only windows owned by the debuggee pid
             are listed (forms, game windows, error dialogs). If True, every
             top-level window on the desktop is listed.
+        visible_only: If True, only windows where IsWindowVisible() is true are
+            listed; hidden/withdrawn windows (WS_VISIBLE unset, e.g. a
+            registration dialog not yet shown) are skipped on the server side.
+        include_children: If True, child/descendant windows of each listed
+            top-level window are also enumerated via EnumChildWindows (one call),
+            so dialog controls, tabs, and embedded panels are captured without
+            post-filtering the text output.
 
     Returns:
-        One line per window: 'hwnd  class  "title"  (left,top,right,bottom)  pid=...'
+        One line per window:
+        'hwnd  class  "title"  (left,top,right,bottom)  pid=...'
+        Child windows (include_children=True) append '  child_of=<parent hwnd>'.
     """
     if _win32 is None:
         return "Error: window enumeration requires Windows (x64dbg-automate win32 bindings)."
@@ -1290,15 +1420,18 @@ def enumerate_windows(pid: int | None = None, all_top_level: bool = False) -> st
                     "or set all_top_level=True."
                 )
 
-        found: list[tuple[int, str, str, int, int, int, int, int]] = []
+        # (hwnd, class, title, left, top, right, bottom, owner, child_of)
+        found: list[tuple[int, str, str, int, int, int, int, int, int | None]] = []
 
-        def callback(hwnd, _lparam):
+        def snapshot(hwnd) -> tuple[int, str, str, int, int, int, int, int] | None:
             owner_pid = ctypes.c_ulong(0)
             owner_pid_p = ctypes.cast(ctypes.byref(owner_pid), ctypes.POINTER(ctypes.c_ulong))
             _win32.GetWindowThreadProcessId(hwnd, owner_pid_p)
             owner = owner_pid.value
             if not all_top_level and owner != pid:
-                return True
+                return None
+            if visible_only and not _win32.IsWindowVisible(hwnd):
+                return None
             title_buf = ctypes.create_unicode_buffer(512)
             _win32.GetWindowTextW(hwnd, title_buf, 512)
             class_buf = ctypes.create_unicode_buffer(256)
@@ -1306,19 +1439,41 @@ def enumerate_windows(pid: int | None = None, all_top_level: bool = False) -> st
             rect = ctypes.wintypes.RECT()
             rect_p = ctypes.cast(ctypes.byref(rect), ctypes.POINTER(ctypes.wintypes.RECT))
             _win32.GetWindowRect(hwnd, rect_p)
-            found.append((hwnd, class_buf.value, title_buf.value,
-                          rect.left, rect.top, rect.right, rect.bottom, owner))
+            return (hwnd, class_buf.value, title_buf.value,
+                    rect.left, rect.top, rect.right, rect.bottom, owner)
+
+        def enumerate_children(parent_hwnd: int) -> None:
+            def child_callback(hwnd, _lparam):
+                entry = snapshot(hwnd)
+                if entry is not None:
+                    found.append((*entry, parent_hwnd))
+                return True
+            cb = _win32.EnumChildWindows.argtypes[0](child_callback)
+            _win32.EnumChildWindows(parent_hwnd, cb, None)
+
+        def callback(hwnd, _lparam):
+            entry = snapshot(hwnd)
+            if entry is not None:
+                found.append((*entry, None))
+                if include_children:
+                    enumerate_children(hwnd)
             return True
 
         cb = _win32.EnumWindows.argtypes[0](callback)
         _win32.EnumWindows(cb, None)
         if not found:
             return f"No windows owned by pid {pid}."
-        lines = [
-            f"{hwnd:#x}  {cls}  \"{title}\"  ({l},{t},{r},{b})  pid={owner}"
-            for hwnd, cls, title, l, t, r, b, owner in found
-        ]
+        lines = []
+        for hwnd, cls, title, l, t, r, b, owner, child_of in found:
+            line = f"{hwnd:#x}  {cls}  \"{title}\"  ({l},{t},{r},{b})  pid={owner}"
+            if child_of is not None:
+                line += f"  child_of={child_of:#x}"
+            lines.append(line)
         scope = "all top-level" if all_top_level else f"owned by pid {pid}"
+        if visible_only:
+            scope += ", visible only"
+        if include_children:
+            scope += " + children"
         return f"[{len(lines)} windows ({scope})]\n" + "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
@@ -1342,7 +1497,9 @@ def read_memory_external(pid: int, address: str, size: int = 256, format: str = 
         address: Plain hex address in the target process (no registers/symbols —
             there is no x64dbg evaluator for foreign processes).
         size: Number of bytes to request (bounded by the response budget for the
-            format, like read_memory).
+            format, like read_memory), or 0 for the largest readable run that fits
+            in one response, stopping at the end of the containing memory region
+            (measured with VirtualQueryEx).
         format: Output encoding per read — 'hex' (default), 'base64', or 'dump'.
 
     Returns:
@@ -1354,7 +1511,16 @@ def read_memory_external(pid: int, address: str, size: int = 256, format: str = 
     try:
         addr = _parse_external_address(address)
         cap = _max_bytes_for(format, addr)
-        size = min(max(1, size), cap) if size > 0 else cap
+        if size <= 0:
+            # Mirror read_memory's size=0: read the whole containing region so the
+            # request never crosses into unreadable memory, still capped by the
+            # format's response budget. Falls back to the budget when the region is
+            # unreadable, so the caller gets a real read error rather than a 0-byte
+            # success (same fallback as read_memory's _readable_span).
+            span = _win32.readable_region_size(pid, addr)
+            size = min(cap, span) if span else cap
+        else:
+            size = min(max(1, size), cap)
         data = _win32.read_process_memory(pid, addr, size)
         encoded = _encode_memory(data, addr, format)
         return f"{pid} @0x{addr:X} ({len(data)} bytes): {encoded}"
@@ -1370,13 +1536,18 @@ def read_memory_external(pid: int, address: str, size: int = 256, format: str = 
 def get_register(register: str) -> str:
     """Read a single register value.
 
+    **Pid anchoring**: the MCP holds ONE shared session, so the value can silently
+    belong to another lane's debuggee. Every reply starts with the debuggee pid this
+    read acted on, resolved per call from the session anchor (get_debugger_status).
+
     Args:
         register: Register name (e.g. 'rax', 'eip', 'rsp', 'eflags')
     """
     try:
         client = _require_client()
+        pid = _resolve_anchor_pid(client)
         val = client.get_reg(register)
-        return f"{register} = {_format_address(val)}"
+        return f"{pid} {register} = {_format_address(val)}"
     except Exception as e:
         return f"Error: {e}"
 
@@ -1400,10 +1571,17 @@ def set_register(register: str, value: str) -> str:
 
 @mcp.tool()
 def get_all_registers() -> str:
-    """Dump all general-purpose registers and flags."""
+    """Dump all general-purpose registers and flags.
+
+    **Pid anchoring**: the MCP holds ONE shared session, so the register values can
+    silently belong to another lane's debuggee. Every reply starts with the debuggee
+    pid this dump came from, resolved per call from the session anchor
+    (get_debugger_status).
+    """
     try:
         client = _require_client()
-        return _render_registers(client)
+        pid = _resolve_anchor_pid(client)
+        return f"{pid} @registers:\n{_render_registers(client)}"
     except Exception as e:
         return f"Error: {e}"
 
@@ -1416,6 +1594,11 @@ def get_all_registers() -> str:
 def eval_expression(expression: str) -> str:
     """Evaluate an x64dbg expression. Supports symbols, registers, arithmetic.
 
+    **Pid anchoring**: the MCP holds ONE shared session, so the expression can
+    silently evaluate against another lane's debuggee. Every reply starts with the
+    debuggee pid this evaluation acted on, resolved per call from the session
+    anchor (get_debugger_status).
+
     Requires a debuggee. With nothing attached x64dbg resolves registers, flags and
     memory reads to 0 and reports success, which is indistinguishable from a real zero.
 
@@ -1424,11 +1607,12 @@ def eval_expression(expression: str) -> str:
     """
     try:
         client = _require_client()
+        pid = _resolve_anchor_pid(client)
         _assert_expression_evaluable(client, expression)
         val, success = client.eval_sync(expression)
         if not success:
-            return f"Evaluation failed for: {expression}"
-        return f"{expression} = {_format_address(val)}"
+            return f"{pid} Evaluation failed for: {expression}"
+        return f"{pid} {expression} = {_format_address(val)}"
     except Exception as e:
         return f"Error: {e}"
 
@@ -1446,6 +1630,52 @@ def execute_command(command: str) -> str:
         client = _require_client()
         result = client.cmd_sync(command)
         return f"Command executed. Success: {result}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def run_command_verified(command: str, verify_expr: str) -> str:
+    """Execute a raw x64dbg command, then VERIFY it took effect.
+
+    execute_command returns no structured confirmation, and some commands
+    (e.g. 'bpl <expr>') report success while storing nothing. This wrapper runs
+    the command and then evaluates verify_expr, which must be non-zero for the
+    result to count as success — so a no-op or silently-ignored command is
+    reported as an error instead of a bare success.
+
+    **Pid anchoring**: the MCP holds ONE shared session, so the verify result can
+    silently come from another lane's debuggee. Every reply carrying an
+    evaluation result starts with the debuggee pid it came from, resolved per
+    call from the session anchor (get_debugger_status).
+
+    Args:
+        command: x64dbg command string
+        verify_expr: x64dbg expression that is non-zero when the command took
+            effect (e.g. '[0x401000] == 0x90' after 'fill 0x401000, 2, 90')
+
+    Returns:
+        On success: '<pid> Command executed. Verified: <verify_expr> = <value>'.
+        On failure: an Error naming whether the command itself failed, the
+        verify expression failed to evaluate, or the verify expression was 0
+        (command did not take effect).
+    """
+    try:
+        client = _require_client()
+        pid = _resolve_anchor_pid(client)
+        result = client.cmd_sync(command)
+        if not result:
+            return f"Error: command failed to execute: {command}"
+        _assert_expression_evaluable(client, verify_expr)
+        val, success = client.eval_sync(verify_expr)
+        if not success:
+            return f"{pid} Error: verify expression failed to evaluate: {verify_expr}"
+        if val == 0:
+            return (
+                f"{pid} Error: command executed ({command}) but the verify expression "
+                f"did not confirm it took effect: {verify_expr} = 0"
+            )
+        return f"{pid} Command executed. Verified: {verify_expr} = {_format_address(val)}"
     except Exception as e:
         return f"Error: {e}"
 
@@ -1474,7 +1704,9 @@ _X64DBG_COMMANDS = {
         ("SetHardwareBreakpointCommand addr, cmd", "Run cmd when a HARDWARE breakpoint hits"),
         ("SetHardwareBreakpointSilent addr, 1/0", "Silent flag for a hardware breakpoint (log without breaking)"),
         ("get_hardware_slots", "MCP tool: which of the 4 debug-register slots are occupied"),
+        ("hardware_free(slot)", "MCP tool: free ONE debug-register slot (0-3) by number, confirmed via get_hardware_slots"),
         ("set_breakpoint(bp_type='hardware', hardware_size=N)", "MCP tool: arm + verify-after-set"),
+        ("set_breakpoint(bp_type='hardware', auto_evict=True)", "MCP tool: when all 4 slots are full, auto-evict the oldest disabled slot before arming"),
         ("set_breakpoint_condition(..., bp_type='hardware')", "MCP tool: hardware condition via bphwcond"),
     ],
     "breakpoint settings": [
@@ -1587,6 +1819,43 @@ def x64dbg_help(category: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tool self-discovery
+# ---------------------------------------------------------------------------
+
+def _list_tools_table() -> list[tuple[str, str]]:
+    """Enumerate every registered MCP tool as (name, one-line description).
+
+    Reads the FastMCP tool registry directly — pure in-memory, no debugger
+    connection and no waits, so it works with nothing attached. Sorted
+    case-insensitively by name. The one-line description is the first
+    non-empty line of each tool's own docstring.
+    """
+    rows = []
+    for tool in mcp._tool_manager.list_tools():
+        first = next(
+            (line.strip() for line in (tool.description or "").splitlines() if line.strip()),
+            "",
+        )
+        rows.append((tool.name, first))
+    return sorted(rows, key=lambda row: row[0].lower())
+
+
+@mcp.tool()
+def list_tools() -> str:
+    """List every installed MCP tool with a one-line description.
+
+    Enumerates the tool registry directly — instant, no debugger connection
+    or waits required. Use this at the start of a session to see the full
+    tool surface instead of reading the source. Sorted by name.
+
+    Returns:
+        Text list of 'name: one-line description' for every registered tool.
+    """
+    rows = _list_tools_table()
+    return "\n".join(f"{name}: {desc}" for name, desc in rows)
+
+
+# ---------------------------------------------------------------------------
 # Breakpoints
 # ---------------------------------------------------------------------------
 
@@ -1599,12 +1868,15 @@ def set_breakpoint(
     hardware_size: int = 1,
     memory_mode: str = "a",
     singleshot: bool = False,
+    auto_evict: bool = False,
 ) -> str:
     """Set a breakpoint (software, hardware, or memory).
 
     Hardware breakpoints are verified after arming: the result reports the actual
     debug-register arm (slot + size) instead of a bare "Breakpoint set.", so a
     silent software fallback or exhausted-slot failure is never mistaken for success.
+    On slot exhaustion (all 4 DRx slots occupied) the failure message includes the
+    per-slot map and points at hardware_free / auto_evict.
 
     Args:
         address_or_symbol: Hex address or symbol name
@@ -1615,6 +1887,9 @@ def set_breakpoint(
             watch a full dword; 8 for a qword). Only with bp_type='hardware'.
         memory_mode: Memory BP mode: 'r', 'w', 'x', 'a' (access)
         singleshot: Single-shot breakpoint
+        auto_evict: Hardware only. When all 4 debug-register slots are occupied,
+            evict the oldest DISABLED hardware BP (fallback: lowest occupied slot)
+            and reuse its slot, then arm + verify. Default False: fail with detail.
     """
     try:
         client = _require_client()
@@ -1630,11 +1905,45 @@ def set_breakpoint(
                     f"Invalid hardware_size {hardware_size}: expected 1, 2, 4, or 8 bytes"
                 )
             hw = HardwareBreakpointType(hardware_mode)
-            result = client.set_hardware_breakpoint(addr, bp_type=hw, size=hardware_size)
+            # auto_evict: when all 4 DRx slots are occupied, evict the oldest
+            # DISABLED hardware BP entry (fallback: lowest occupied slot) and
+            # retry the arm once. The set+verify-after-set loop below is the
+            # authoritative check — a disabled entry that does not actually hold
+            # a register triggers a second eviction of a real occupant.
+            evicted_desc = ""
+            evicted_notes: list[str] = []
+            result = None
+            attempt = 0
+            while True:
+                attempt += 1
+                if auto_evict and attempt <= 2:
+                    evicted_slot, evicted_bp, evict_fail = _evict_oldest_hardware_slot(client)
+                    if evicted_slot is not None:
+                        evicted_notes.append(
+                            f"auto-evicted slot {evicted_slot}: "
+                            f"{_format_address(evicted_bp.addr)} size={evicted_bp.hwSize} "
+                            f"name={evicted_bp.name or '-'}"
+                        )
+                        evicted_desc = (
+                            f" ({'; '.join(evicted_notes)})" if evicted_notes else ""
+                        )
+                    elif evict_fail:
+                        return (
+                            f"Failed to set hardware BP at {address_or_symbol} [{hardware_mode}] "
+                            f"size={hardware_size} — auto-evict did not free a debug register "
+                            f"({evict_fail}).\n{get_hardware_slots()}"
+                        )
+                result = client.set_hardware_breakpoint(addr, bp_type=hw, size=hardware_size)
+                if result or not auto_evict or attempt >= 2:
+                    break
             if not result:
+                # Never a bare failure on the exhaustion path: report per-slot state.
                 return (
-                    f"Failed to set hardware BP at {address_or_symbol} [{hardware_mode}] — "
-                    "all 4 debug slots may be exhausted or the address is unsupported."
+                    f"Failed to set hardware BP at {address_or_symbol} [{hardware_mode}] "
+                    f"size={hardware_size} — all 4 debug slots may be exhausted or the "
+                    f"address is unsupported. Retry with auto_evict=True to reclaim the "
+                    f"oldest disabled/occupied slot, or free one with hardware_free.\n"
+                    f"{get_hardware_slots()}"
                 )
             # Verify-after-set: report the ACTUAL arm so a SW fallback or lost slot
             # is visible instead of a bare success.
@@ -1651,7 +1960,7 @@ def set_breakpoint(
             if hit is not None:
                 return (
                     f"Hardware BP set at {_format_address(hit.addr)} [{hardware_mode}] "
-                    f"size={hit.hwSize} confirmed (slot {hit.slot})"
+                    f"size={hit.hwSize} confirmed (slot {hit.slot}){evicted_desc}"
                 )
             return (
                 f"Hardware BP set at {address_or_symbol} [{hardware_mode}] size={hardware_size} "
@@ -1733,11 +2042,17 @@ def toggle_breakpoint(address: str | None = None, bp_type: str = "software", ena
 def list_breakpoints(bp_type: str = "software") -> str:
     """List all breakpoints of a given type.
 
+    **Pid anchoring**: the MCP holds ONE shared session, so the listed addresses
+    can silently belong to another lane's debuggee. Every reply starts with the
+    debuggee pid this listing was taken from, resolved per call from the session
+    anchor (get_debugger_status).
+
     Args:
         bp_type: 'software', 'hardware', or 'memory'
     """
     try:
         client = _require_client()
+        pid = _resolve_anchor_pid(client)
         type_map = {
             "software": BreakpointType.BpNormal,
             "hardware": BreakpointType.BpHardware,
@@ -1746,7 +2061,7 @@ def list_breakpoints(bp_type: str = "software") -> str:
         bt = type_map.get(bp_type, BreakpointType.BpNormal)
         bps = client.get_breakpoints(bt)
         if not bps:
-            return f"No {bp_type} breakpoints set."
+            return f"{pid} No {bp_type} breakpoints set."
         lines = []
         for bp in bps:
             status = "ON" if bp.enabled else "OFF"
@@ -1755,7 +2070,7 @@ def list_breakpoints(bp_type: str = "software") -> str:
                 f"{_format_address(bp.addr)}  [{status}]  Name: {bp.name}  "
                 f"Module: {bp.mod}  Hits: {bp.hitCount}  Singleshot: {bp.singleshoot}{extra}"
             )
-        return "\n".join(lines)
+        return f"{pid} @breakpoints ({bp_type}):\n" + "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
 
@@ -1799,6 +2114,108 @@ def get_hardware_slots() -> str:
         return f"Error: {e}"
 
 
+def _enumerate_hardware_slots(client) -> tuple[dict[int, object], list[object]]:
+    """Return (occupied, others) for hardware breakpoints.
+
+    occupied maps a debug-register slot (0-3) to the ENABLED hardware BP using
+    it (first wins if several report the same slot). others collects hardware
+    BPs that are not currently holding a slot: disabled BPs, or BPs with a slot
+    value outside 0-3. Shared by hardware_free and set_breakpoint(auto_evict)
+    so slot occupancy/eviction always views the same state get_hardware_slots().
+    """
+    bps = client.get_breakpoints(BreakpointType.BpHardware) or []
+    occupied: dict[int, object] = {}
+    others: list[object] = []
+    for bp in bps:
+        if bp.enabled and bp.slot >= 0 and bp.slot < 4:
+            occupied.setdefault(bp.slot, bp)
+        else:
+            others.append(bp)
+    return occupied, others
+
+
+def _evict_oldest_hardware_slot(client) -> tuple[int | None, object | None, str]:
+    """Free one hardware debug-register slot so a new hardware BP can arm.
+
+    Only acts when all 4 enabled slots are occupied. Priority: the oldest
+    DISABLED hardware BP entry still listed with a valid slot (lowest slot
+    number first — 'oldest disabled'), falling back to the lowest-numbered
+    occupied slot. Clears the candidate via bphc on its address; the caller's
+    set+verify-after-set retry is the authoritative check that a register was
+    actually freed.
+
+    Returns:
+        (freed_slot, evicted_bp, "") on success; (None, None, "") when a slot
+        was already free (nothing evicted); or (None, candidate, reason) when
+        clearing was refused.
+    """
+    occupied, others = _enumerate_hardware_slots(client)
+    if len(occupied) < 4:
+        return None, None, ""  # a slot is already free — nothing to evict
+    disabled = sorted(
+        (bp for bp in others if 0 <= bp.slot < 4),
+        key=lambda bp: bp.slot,
+    )
+    if disabled:
+        candidate = disabled[0]
+        label = f"disabled slot {candidate.slot}"
+    else:
+        slot = min(occupied)
+        candidate = occupied[slot]
+        label = f"slot {slot}"
+    ok = client.clear_hardware_breakpoint(candidate.addr)
+    if not ok:
+        return None, candidate, f"clearing {label} ({_format_address(candidate.addr)}) was refused"
+    return candidate.slot, candidate, ""
+
+
+@mcp.tool()
+def hardware_free(slot: int) -> str:
+    """Free one hardware-breakpoint debug-register slot (0-3) by number.
+
+    Finds the ENABLED hardware BP currently occupying `slot` and clears it
+    (bphc on its address), then re-enumerates to confirm the slot is free.
+    Pairs with get_hardware_slots(): run that first to pick which slot to
+    reclaim when set_breakpoint(bp_type='hardware') exhausts all 4 DRx slots.
+    Idempotent — freeing an already-free slot reports it as such.
+
+    Args:
+        slot: Debug-register slot index 0-3.
+
+    Returns:
+        Confirmation of which BP was freed plus the resulting slot map, or an
+        error string.
+    """
+    try:
+        client = _require_client()
+        if isinstance(slot, bool) or not isinstance(slot, int) or not (0 <= slot <= 3):
+            return f"Error: invalid slot {slot!r}: expected an integer 0-3"
+        bps = client.get_breakpoints(BreakpointType.BpHardware) or []
+        occupant = next((bp for bp in bps if bp.slot == slot and bp.enabled), None)
+        if occupant is None:
+            return (
+                f"Hardware slot {slot} is already free — no enabled hardware BP "
+                f"occupies it.\n{get_hardware_slots()}"
+            )
+        ok = client.clear_hardware_breakpoint(occupant.addr)
+        bps2 = client.get_breakpoints(BreakpointType.BpHardware) or []
+        still = next((bp for bp in bps2 if bp.slot == slot and bp.enabled), None)
+        if not ok or still is not None:
+            return (
+                f"Failed to free hardware slot {slot}: "
+                f"{_format_address(occupant.addr)} (size={occupant.hwSize} "
+                f"name={occupant.name or '-'}) could not be cleared.\n"
+                f"{get_hardware_slots()}"
+            )
+        return (
+            f"Freed hardware slot {slot}: cleared {_format_address(occupant.addr)} "
+            f"(size={occupant.hwSize} name={occupant.name or '-'}).\n"
+            f"{get_hardware_slots()}"
+        )
+    except Exception as e:
+        return f"Error: {e}"
+
+
 # ---------------------------------------------------------------------------
 # Assembly
 # ---------------------------------------------------------------------------
@@ -1807,12 +2224,18 @@ def get_hardware_slots() -> str:
 def disassemble(address: str, count: int = 10) -> str:
     """Disassemble instructions at an address.
 
+    **Pid anchoring**: the MCP holds ONE shared session, so the instruction bytes
+    can silently belong to another lane's debuggee. Every reply starts with the
+    debuggee pid this disassembly acted on, resolved per call from the session
+    anchor (get_debugger_status).
+
     Args:
         address: Address — hex ('0x401000'), register ('RIP'), symbol, or expression
         count: Number of instructions to disassemble (max 100)
     """
     try:
         client = _require_client()
+        pid = _resolve_anchor_pid(client)
         addr = _parse_address_or_expression(address)
         count = min(count, 100)
         lines = []
@@ -1824,7 +2247,7 @@ def disassemble(address: str, count: int = 10) -> str:
                 break
             lines.append(f"{_format_address(current)}  {ins.symbolized_instruction}")
             current += ins.instr_size
-        return "\n".join(lines)
+        return f"{pid} @{_format_address(addr)} ({len(lines)} insns):\n" + "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
 
@@ -1873,16 +2296,22 @@ def set_label(address: str, text: str) -> str:
 def get_label(address: str) -> str:
     """Get the label at an address.
 
+    **Pid anchoring**: the MCP holds ONE shared session, so the label can silently
+    belong to another lane's debuggee. Every reply starts with the debuggee pid
+    this lookup acted on, resolved per call from the session anchor
+    (get_debugger_status).
+
     Args:
         address: Hex address
     """
     try:
         client = _require_client()
+        pid = _resolve_anchor_pid(client)
         addr = _parse_address_or_expression(address)
         label = client.get_label_at(addr)
         if not label:
-            return f"No label at {_format_address(addr)}."
-        return f"{_format_address(addr)}: {label}"
+            return f"{pid} No label at {_format_address(addr)}."
+        return f"{pid} @{_format_address(addr)}: {label}"
     except Exception as e:
         return f"Error: {e}"
 
@@ -1908,16 +2337,22 @@ def set_comment(address: str, text: str) -> str:
 def get_comment(address: str) -> str:
     """Get the comment at an address.
 
+    **Pid anchoring**: the MCP holds ONE shared session, so the comment can
+    silently belong to another lane's debuggee. Every reply starts with the
+    debuggee pid this lookup acted on, resolved per call from the session anchor
+    (get_debugger_status).
+
     Args:
         address: Hex address
     """
     try:
         client = _require_client()
+        pid = _resolve_anchor_pid(client)
         addr = _parse_address_or_expression(address)
         comment = client.get_comment_at(addr)
         if not comment:
-            return f"No comment at {_format_address(addr)}."
-        return f"{_format_address(addr)}: {comment}"
+            return f"{pid} No comment at {_format_address(addr)}."
+        return f"{pid} @{_format_address(addr)}: {comment}"
     except Exception as e:
         return f"Error: {e}"
 
@@ -1926,16 +2361,23 @@ def get_comment(address: str) -> str:
 def get_symbol(address: str) -> str:
     """Look up the symbol at an address.
 
+    **Pid anchoring**: the MCP holds ONE shared session, so the symbol can silently
+    belong to another lane's debuggee. Every reply starts with the debuggee pid
+    this lookup acted on, resolved per call from the session anchor
+    (get_debugger_status).
+
     Args:
         address: Hex address
     """
     try:
         client = _require_client()
+        pid = _resolve_anchor_pid(client)
         addr = _parse_address_or_expression(address)
         sym = client.get_symbol_at(addr)
         if sym is None:
-            return f"No symbol at {_format_address(addr)}."
+            return f"{pid} No symbol at {_format_address(addr)}."
         return (
+            f"{pid} @{_format_address(addr)}:\n"
             f"Address: {_format_address(sym.addr)}\n"
             f"Decorated: {sym.decoratedSymbol}\n"
             f"Undecorated: {sym.undecoratedSymbol}\n"
@@ -2023,20 +2465,26 @@ def switch_thread(tid: int) -> str:
 def get_thread_list() -> str:
     """List all threads in the debuggee.
 
+    **Pid anchoring**: the MCP holds ONE shared session, so the thread listing
+    can silently belong to another lane's debuggee. Every reply starts with the
+    debuggee pid this listing was taken from, resolved per call from the session
+    anchor (get_debugger_status).
+
     Shows thread ID, start address, local base, and name for each thread.
     """
     try:
         client = _require_client()
+        pid = _resolve_anchor_pid(client)
         threads = client.get_threads()
         if not threads:
-            return "No threads found."
+            return f"{pid} No threads found."
         lines = []
         for t in threads:
             lines.append(
                 f"TID: {t.thread_id}  |  Start: 0x{t.start_address:x}  |  "
                 f"LocalBase: 0x{t.local_base:x}  |  Name: {t.thread_name or '(unnamed)'}"
             )
-        return "\n".join(lines)
+        return f"{pid} @threads:\n" + "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
 
@@ -2063,6 +2511,34 @@ def get_latest_event() -> str:
         return f"Error: {e}"
 
 
+def _wait_bail_state_line() -> str:
+    """Compact debuggee state line appended to wait_for_event bail replies.
+
+    Every bail carries `state: cip=0x..., running|paused, pid=...` so the agent
+    learns where the debuggee ended up without a follow-up get_debugger_status()
+    call. cip is best-effort — x64dbg only serves registers while paused, so a
+    running target reports 'n/a'. Never raises and performs no waits: a bail stays
+    instant and inside the 5 s cap (AGENTS.md rule 4).
+    """
+    try:
+        client = _require_client()
+        if not client.is_debugging():
+            return "state: no debuggee"
+        try:
+            cip = _format_address(client.get_reg("cip"))
+        except Exception:
+            cip = "n/a"
+        state = "running" if client.is_running() else "paused"
+        try:
+            pid = client.debugee_pid()
+            pid_str = str(pid) if isinstance(pid, int) else "n/a"
+        except Exception:
+            pid_str = "n/a"
+        return f"state: cip={cip}, {state}, pid={pid_str}"
+    except Exception:
+        return "state: n/a"
+
+
 @mcp.tool()
 def wait_for_event(event_type: str, timeout: int = 5) -> str:
     """Wait for a specific debug event type — state-aware, never blocks on a silent target.
@@ -2076,6 +2552,10 @@ def wait_for_event(event_type: str, timeout: int = 5) -> str:
     * Running, no event, no state     -> 'STILL RUNNING: no <EVENT> in ~1 s...' (loop
       change for ~1 s                  or bp never reached): re-poll or classify;
     * Debuggee stops, no event queued -> 'STOPPED...' (other stop reason / bp wiped).
+
+    Every bail reply ends with a compact state line — `state: cip=0x..., running|paused,
+    pid=...` (cip is 'n/a' while the target is running) — so no follow-up
+    get_debugger_status() call is needed to see where the debuggee ended up.
 
     The full timeout is only ever consumed while the debugger is actively running,
     and even then the no-progress bail fires after ~1 s of silence. This is what
@@ -2098,7 +2578,7 @@ def wait_for_event(event_type: str, timeout: int = 5) -> str:
         et = EventType(event_type)
 
         if not client.is_debugging():
-            return NO_DEBUGGEE_MSG
+            return f"{NO_DEBUGGEE_MSG}\n{_wait_bail_state_line()}"
 
         def _fmt(event) -> str:
             data_str = ""
@@ -2119,7 +2599,8 @@ def wait_for_event(event_type: str, timeout: int = 5) -> str:
             return (
                 f"NOT WAITING: debuggee is paused/stopped, so {event_type} can only "
                 "fire after go()/step. Classify the stage via enumerate_windows() or "
-                "get_debugger_status() and decide — never block on a paused target."
+                "get_debugger_status() and decide — never block on a paused target.\n"
+                + _wait_bail_state_line()
             )
 
         start = time.monotonic()
@@ -2135,19 +2616,27 @@ def wait_for_event(event_type: str, timeout: int = 5) -> str:
                 if event is not None:
                     return _fmt(event)
                 if not client.is_debugging():
-                    return "Debuggee exited while waiting; no event arrived."
+                    return (
+                        "Debuggee exited while waiting; no event arrived.\n"
+                        + _wait_bail_state_line()
+                    )
                 return (
                     f"STOPPED: debuggee paused but no {event_type} was queued (stopped "
                     "for another reason, or the breakpoint was wiped). Read "
-                    "get_debugger_status()/enumerate_windows() to classify."
+                    "get_debugger_status()/enumerate_windows() to classify.\n"
+                    + _wait_bail_state_line()
                 )
             if time.monotonic() - start >= WAIT_EVENT_NO_PROGRESS_SECONDS:
                 return (
                     f"STILL RUNNING: no {event_type} in ~{WAIT_EVENT_NO_PROGRESS_SECONDS:g} s "
                     "with no state change (loop, or the breakpoint is never reached). "
-                    "Re-poll, check get_debugger_status()/enumerate_windows(), or re-arm."
+                    "Re-poll, check get_debugger_status()/enumerate_windows(), or re-arm.\n"
+                    + _wait_bail_state_line()
                 )
-        return f"Timed out waiting for {event_type} after {timeout}s."
+        return (
+            f"Timed out waiting for {event_type} after {timeout}s.\n"
+            + _wait_bail_state_line()
+        )
     except Exception as e:
         return f"Error: {e}"
 
@@ -2298,6 +2787,40 @@ def refresh_gui() -> str:
 # Breakpoint Conditions & Logging
 # ---------------------------------------------------------------------------
 
+def _verify_breakpoint_field(client, bp_type: str, addr: int, attr: str, expected: str) -> str:
+    """Verify-after-set read-back for a breakpoint field.
+
+    Mirrors P3's verify pattern for hardware arming: a set is reported with the
+    ACTUAL stored value instead of a bare success, so a silently-ignored set
+    (wrong bp_type, address mismatch, target that dropped the BP) is visible.
+    Software sets read through BreakpointType.BpNormal, hardware through
+    BreakpointType.BpHardware.
+
+    Returns:
+        A verification line on success ('Value verified: breakCondition=...'),
+        or a 'NOT verified' warning naming the reason (empty stored value,
+        mismatched value, no breakpoint found, or read-back failure).
+    """
+    bt = BreakpointType.BpHardware if bp_type == "hardware" else BreakpointType.BpNormal
+    try:
+        raw = client.get_breakpoints(bt)
+        bps = list(raw) if raw else []
+    except Exception as e:
+        return f"NOT verified — read-back of breakpoints failed: {e}"
+    for bp in bps:
+        if bp.addr == addr:
+            actual = getattr(bp, attr, "") or ""
+            if not actual.strip():
+                return f"NOT verified — {attr} is empty on the stored breakpoint at {_format_address(addr)}"
+            if actual.strip() == expected.strip():
+                return f"Value verified: {attr}={actual!r}"
+            return (
+                f"NOT verified — stored {attr}={actual!r} "
+                f"does not match requested {expected!r}"
+            )
+    return f"NOT verified — no {bp_type} breakpoint found at {_format_address(addr)}"
+
+
 @mcp.tool()
 def set_breakpoint_condition(address: str, condition: str, bp_type: str = "software") -> str:
     """Set a condition on a breakpoint.
@@ -2305,6 +2828,10 @@ def set_breakpoint_condition(address: str, condition: str, bp_type: str = "softw
     With bp_type='hardware' this uses x64dbg's bphwcond (SetHardwareBreakpointCondition)
     — no software breakpoint involved, so it works on pages where a SW BP would be
     wiped or detected (e.g. PAGECRYPT-protected regions).
+
+    The set is verified after the fact: the result reports the ACTUAL stored
+    condition (read back from the breakpoint list), or 'NOT verified' when the
+    debugger did not store the requested value.
 
     Args:
         address: Hex address of the breakpoint
@@ -2318,7 +2845,10 @@ def set_breakpoint_condition(address: str, condition: str, bp_type: str = "softw
             result = client.set_hardware_breakpoint_condition(addr, condition)
         else:
             result = client.set_breakpoint_condition(addr, condition)
-        return f"Breakpoint condition set at {_format_address(addr)}." if result else "Failed to set condition."
+        if not result:
+            return f"Failed to set condition at {_format_address(addr)}."
+        verify = _verify_breakpoint_field(client, bp_type, addr, "breakCondition", condition)
+        return f"Breakpoint condition set at {_format_address(addr)}. {verify}"
     except Exception as e:
         return f"Error: {e}"
 
@@ -2330,6 +2860,10 @@ def set_breakpoint_log(address: str, log_text: str, silent: bool = False, bp_typ
     With bp_type='hardware' this uses x64dbg's bphwlog (SetHardwareBreakpointLog)
     plus SetHardwareBreakpointSilent when silent=True — no software breakpoint
     involved, so log-without-breaking works on protected pages too.
+
+    The set is verified after the fact: the result reports the ACTUAL stored log
+    text (read back from the breakpoint list), or 'NOT verified' when the
+    debugger did not store the requested value.
 
     Args:
         address: Hex address of the breakpoint
@@ -2344,7 +2878,10 @@ def set_breakpoint_log(address: str, log_text: str, silent: bool = False, bp_typ
             result = client.set_hardware_breakpoint_log(addr, log_text, silent)
         else:
             result = client.set_breakpoint_log(addr, log_text, silent)
-        return f"Breakpoint log set at {_format_address(addr)}." if result else "Failed to set log."
+        if not result:
+            return f"Failed to set log at {_format_address(addr)}."
+        verify = _verify_breakpoint_field(client, bp_type, addr, "logText", log_text)
+        return f"Breakpoint log set at {_format_address(addr)}. {verify}"
     except Exception as e:
         return f"Error: {e}"
 
@@ -2355,6 +2892,10 @@ def set_breakpoint_command(address: str, command: str, bp_type: str = "software"
 
     With bp_type='hardware' this uses x64dbg's SetHardwareBreakpointCommand — no
     software breakpoint involved, so command-on-hit works on protected pages too.
+
+    The set is verified after the fact: the result reports the ACTUAL stored
+    command (read back from the breakpoint list), or 'NOT verified' when the
+    debugger did not store the requested value.
 
     Args:
         address: Hex address of the breakpoint
@@ -2368,7 +2909,10 @@ def set_breakpoint_command(address: str, command: str, bp_type: str = "software"
             result = client.set_hardware_breakpoint_command(addr, command)
         else:
             result = client.set_breakpoint_command(addr, command)
-        return f"Breakpoint command set at {_format_address(addr)}." if result else "Failed to set command."
+        if not result:
+            return f"Failed to set command at {_format_address(addr)}."
+        verify = _verify_breakpoint_field(client, bp_type, addr, "commandText", command)
+        return f"Breakpoint command set at {_format_address(addr)}. {verify}"
     except Exception as e:
         return f"Error: {e}"
 
@@ -2379,16 +2923,23 @@ def set_breakpoint_command(address: str, command: str, bp_type: str = "software"
 
 @mcp.tool()
 def get_stack_trace() -> str:
-    """Get the current call stack."""
+    """Get the current call stack.
+
+    **Pid anchoring**: the MCP holds ONE shared session, so the stack frames can
+    silently belong to another lane's debuggee. Every reply starts with the
+    debuggee pid this trace was taken from, resolved per call from the session
+    anchor (get_debugger_status).
+    """
     try:
         client = _require_client()
+        pid = _resolve_anchor_pid(client)
         frames = client.get_stack_trace()
         if not frames:
-            return "No stack frames."
+            return f"{pid} No stack frames."
         lines = []
         for i, frame in enumerate(frames):
             lines.append(f"#{i} {_format_address(frame.addr)} from {_format_address(frame.from_addr)}  {frame.comment}")
-        return "\n".join(lines)
+        return f"{pid} @stack trace:\n" + "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
 
@@ -2401,6 +2952,11 @@ def get_stack_trace() -> str:
 def search_memory(address: str, size: int, pattern: str) -> str:
     """Search memory for a byte pattern.
 
+    **Pid anchoring**: the MCP holds ONE shared session, so the search can
+    silently run against another lane's debuggee. Every reply starts with the
+    debuggee pid this search acted on, resolved per call from the session anchor
+    (get_debugger_status).
+
     Args:
         address: Start address to search from
         size: Number of bytes to search
@@ -2408,16 +2964,17 @@ def search_memory(address: str, size: int, pattern: str) -> str:
     """
     try:
         client = _require_client()
+        pid = _resolve_anchor_pid(client)
         addr = _parse_address_or_expression(address)
         cleaned = pattern.replace(" ", "").replace("\n", "")
         pat_bytes = bytes.fromhex(cleaned)
         results = client.search_memory(addr, size, pat_bytes)
         if not results:
-            return "Pattern not found."
+            return f"{pid} Pattern not found."
         lines = [f"{_format_address(a)}" for a in results[:100]]
         if len(results) > 100:
             lines.append(f"... and {len(results) - 100} more")
-        return f"Found {len(results)} match(es):\n" + "\n".join(lines)
+        return f"{pid} Found {len(results)} match(es):\n" + "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
 
@@ -2428,12 +2985,19 @@ def search_memory(address: str, size: int, pattern: str) -> str:
 
 @mcp.tool()
 def get_threads() -> str:
-    """List all threads in the debuggee."""
+    """List all threads in the debuggee.
+
+    **Pid anchoring**: the MCP holds ONE shared session, so the thread listing
+    can silently belong to another lane's debuggee. Every reply starts with the
+    debuggee pid this listing was taken from, resolved per call from the session
+    anchor (get_debugger_status).
+    """
     try:
         client = _require_client()
+        pid = _resolve_anchor_pid(client)
         threads = client.get_threads()
         if not threads:
-            return "No threads found."
+            return f"{pid} No threads found."
         lines = []
         for t in threads:
             name = f"  ({t.thread_name})" if t.thread_name else ""
@@ -2441,7 +3005,7 @@ def get_threads() -> str:
                 f"TID: {t.thread_id}  Start: {_format_address(t.start_address)}  "
                 f"LocalBase: {_format_address(t.local_base)}{name}"
             )
-        return "\n".join(lines)
+        return f"{pid} @threads:\n" + "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
 
@@ -2454,17 +3018,22 @@ def get_threads() -> str:
 def read_string(address: str, max_len: int = 512) -> str:
     """Read a null-terminated string from debuggee memory.
 
+    **Pid anchoring**: the MCP holds ONE shared session, so the read can silently
+    land on another lane's debuggee. Every reply starts with the debuggee pid this
+    read acted on, resolved per call from the session anchor (get_debugger_status).
+
     Args:
         address: Hex address to read from
         max_len: Maximum number of bytes to read
     """
     try:
         client = _require_client()
+        pid = _resolve_anchor_pid(client)
         addr = _parse_address_or_expression(address)
         text = client.read_string_at(addr, max_len)
         if not text:
-            return f"No string at {_format_address(addr)}."
-        return f"{_format_address(addr)}: \"{text}\""
+            return f"{pid} No string at {_format_address(addr)}."
+        return f"{pid} {_format_address(addr)}: \"{text}\""
     except Exception as e:
         return f"Error: {e}"
 
