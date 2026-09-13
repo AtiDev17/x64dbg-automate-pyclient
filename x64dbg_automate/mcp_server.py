@@ -68,6 +68,135 @@ def _require_client() -> X64DbgClient:
     return _client
 
 
+# ---------------------------------------------------------------------------
+# Session lease (N2) — see X64DBG_MCP_FEEDBACK.md row "connect_to_session".
+# The MCP server is a process singleton: ONE shared X64DbgClient is swapped by
+# every start_session / connect_to_session / connect_remote call. With two or
+# more lanes sharing the server, lane B's connect silently re-targets lane A's
+# mutating calls onto lane B's debuggee. Lanes opt into protection by asserting
+# the same `owner` token they received from their connect/start reply on every
+# mutating tool call; _guard_lease refuses the call (before any side effect)
+# when the currently connected debuggee is leased to a different owner.
+# ---------------------------------------------------------------------------
+
+_SESSION_LEASE: dict[int, str] = {}       # x64dbg session pid -> owner token
+_CURRENT_SESSION_PID: int | None = None   # session pid the shared `_client` points at
+
+
+def _register_lease(pid: int, owner: str) -> str:
+    """Record which owner holds session `pid`; return the effective owner token.
+
+    An empty owner is replaced by a deterministic generated token so even an
+    owner-less connect is verifiable by whatever mutating calls echo it back.
+    """
+    global _CURRENT_SESSION_PID
+    _CURRENT_SESSION_PID = pid
+    if not owner:
+        owner = f"auto-{pid:x}-{os.getpid():x}"
+    _SESSION_LEASE[pid] = owner
+    return owner
+
+
+def _release_lease() -> None:
+    """Drop the current-session pointer (disconnect / terminate)."""
+    global _CURRENT_SESSION_PID
+    _CURRENT_SESSION_PID = None
+
+
+def _lease_owner(fallback: str = "none") -> str:
+    """Owner token for the currently connected session, or `fallback`."""
+    pid = _CURRENT_SESSION_PID
+    if pid is None:
+        return fallback
+    return _SESSION_LEASE.get(pid, fallback)
+
+
+def _session_lease_info() -> str:
+    """Human-readable lease state (used by the session_lease tool)."""
+    pid = _CURRENT_SESSION_PID
+    if pid is None:
+        return "No session lease registered."
+    return f"Session PID: {pid}  Owner: {_SESSION_LEASE.get(pid, 'none')}"
+
+
+def _guard_lease(owner: str) -> X64DbgClient:
+    """Return the active client, refusing the call when the lease is violated.
+
+    Empty `owner` runs unguarded (backwards compatible). An asserted `owner`
+    must equal the token registered for the currently connected session —
+    otherwise another lane has re-connected the shared client onto a different
+    debuggee and this mutating call would act on the WRONG process. Refuse
+    before any side effect can happen.
+    """
+    client = _require_client()
+    if not owner:
+        return client
+    pid = _CURRENT_SESSION_PID
+    if pid is None:
+        raise RuntimeError(
+            f"SESSION-LEASE not established for the connected client. Re-run "
+            f"connect_to_session/start_session and echo its returned 'Owner' token "
+            f"on mutating calls (owner='{owner}')."
+        )
+    actual = _SESSION_LEASE.get(pid)
+    if actual != owner:
+        raise RuntimeError(
+            f"SESSION-LEASE-MISMATCH: connected debuggee (session PID {pid}) is leased "
+            f"to owner {actual!r}, but this call asserts {owner!r}. Another lane likely "
+            f"re-connected the shared MCP client. Re-run connect_to_session/start_session "
+            f"and pass its returned Owner token, or omit owner to run unguarded."
+        )
+    return client
+
+
+# ---------------------------------------------------------------------------
+# Stale-DB breakpoint census/clear (N1) — see X64DBG_MCP_FEEDBACK.md row
+# "start_session". A fresh x64dbg restores the previous session's *.db32 and
+# can silently re-arm stale hardware breakpoints, exhausting all 4 DRx slots
+# before a lane arms anything of its own.
+# ---------------------------------------------------------------------------
+
+def _bp_census(client: X64DbgClient) -> dict[str, int]:
+    """Count existing breakpoints per type; -1 when a census is unavailable
+    (fresh session whose plugin is not yet ready to answer get_breakpoints)."""
+    counts: dict[str, int] = {}
+    for name, bt in (
+        ("software", BreakpointType.BpNormal),
+        ("hardware", BreakpointType.BpHardware),
+        ("memory", BreakpointType.BpMemory),
+    ):
+        try:
+            counts[name] = len(client.get_breakpoints(bt) or [])
+        except Exception:
+            counts[name] = -1
+    return counts
+
+
+def _clear_all_breakpoints(client: X64DbgClient) -> dict[str, int]:
+    """Best-effort clear of every existing breakpoint (stale DB restorations).
+
+    Returns per-type counts of successfully cleared breakpoints. Best-effort on
+    purpose: deleting hardware breakpoints needs a writable debug-register state,
+    which a freshly launched x64dbg may not expose until the debuggee is loaded.
+    """
+    cleared = {"software": 0, "hardware": 0, "memory": 0}
+    for name, bt, clear in (
+        ("software", BreakpointType.BpNormal, client.clear_breakpoint),
+        ("hardware", BreakpointType.BpHardware, client.clear_hardware_breakpoint),
+        ("memory", BreakpointType.BpMemory, client.clear_memory_breakpoint),
+    ):
+        try:
+            for bp in client.get_breakpoints(bt) or []:
+                try:
+                    if clear(bp.addr):
+                        cleared[name] += 1
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return cleared
+
+
 def _parse_address_or_expression(s: str) -> int:
     """Parse an address string to int.
 
@@ -475,17 +604,32 @@ def list_sessions() -> str:
 
 
 @mcp.tool()
-def start_session(x64dbg_path: str = "", target_exe: str = "", cmdline: str = "", current_dir: str = "") -> str:
+def start_session(x64dbg_path: str = "", target_exe: str = "", cmdline: str = "",
+                  current_dir: str = "", clear_bps: bool = False, owner: str = "") -> str:
     """Launch a new x64dbg instance and optionally load an executable.
 
     If x96dbg.exe (the launcher) is given, the correct x64dbg.exe or x32dbg.exe is
     selected automatically based on the target executable's PE bitness.
+
+    **Stale-DB breakpoints**: x64dbg restores the previous session's *.db32 on
+    launch, which can silently re-arm breakpoints (including hardware BPs that
+    exhaust all 4 DRx slots). set clear_bps=True to clear them immediately;
+    otherwise the reply warns about any restored breakpoints it could count.
+
+    **Session lease**: the MCP server is shared by every active lane — a fresh
+    start re-points the shared client at THIS debugger, hijacking sibling lanes'
+    mutating calls. The reply includes an 'Owner' token; echo it on every
+    mutating call you make so those calls refuse to run after another lane
+    reconnects (see session_lease).
 
     Args:
         x64dbg_path: Path to x64dbg installation (x96dbg.exe, x64dbg.exe, or x32dbg.exe). Falls back to X64DBG_PATH env var if not provided.
         target_exe: Path to executable to debug (optional)
         cmdline: Command-line arguments for the target (optional)
         current_dir: Working directory for the target (optional)
+        clear_bps: Clear any breakpoints restored from the previous session's DB
+            right after connect (best-effort; hardware clears may need a debuggee).
+        owner: Lease token this caller asserts (see session_lease).
     """
     global _client
     try:
@@ -493,22 +637,66 @@ def start_session(x64dbg_path: str = "", target_exe: str = "", cmdline: str = ""
         resolved = _resolve_debugger_path(path, target_exe)
         _client = X64DbgClient(resolved)
         pid = _client.start_session(target_exe, cmdline, current_dir)
-        return f"Session started with {Path(resolved).name}. Debugger PID: {pid}"
+        token = _register_lease(pid, owner)
+        notes = []
+        if clear_bps:
+            cleared = _clear_all_breakpoints(_client)
+            total_cleared = sum(cleared.values())
+            if total_cleared:
+                details = ", ".join(f"{k}={v}" for k, v in cleared.items())
+                notes.append(f"cleared {total_cleared} stale DB breakpoint(s) [{details}]")
+            else:
+                notes.append("no breakpoints restored to clear")
+            slots = _bp_census(_client)
+            occupied_hw = slots.get("hardware", 0)
+            if occupied_hw > 0:
+                notes.append(
+                    f"NOTE: {occupied_hw} hardware slot(s) still occupied after clear "
+                    "(HW clears need a loaded debuggee; run get_hardware_slots / hardware_free)"
+                )
+        else:
+            census = _bp_census(_client)
+            if all(v == -1 for v in census.values()):
+                notes.append(
+                    "stale-BP census unavailable (plugin still warming up) — after "
+                    "bring-up re-run or use get_hardware_slots before arming HW BPs"
+                )
+            else:
+                stale = sum(v for v in census.values() if v > 0)
+                if stale:
+                    notes.append(
+                        f"WARNING: {stale} breakpoint(s) restored from the previous "
+                        f"session's DB ({census}); 4-slot HW exhaustion risk — re-run "
+                        f"with clear_bps=True to clear them before arming your own."
+                    )
+        tail = " ".join(notes)
+        return (
+            f"Session started with {Path(resolved).name}. Debugger PID: {pid} "
+            f"Owner: {token}." + (f" {tail}" if tail else "")
+        )
     except Exception as e:
         _client = None
         return f"Error: {e}"
 
 
 @mcp.tool()
-def connect_to_session(x64dbg_path: str = "", session_pid: int = 0) -> str:
+def connect_to_session(x64dbg_path: str = "", session_pid: int = 0, owner: str = "") -> str:
     """Connect to an already-running x64dbg instance.
 
     If x96dbg.exe is given, it is resolved to x64dbg.exe (default).
     The actual debugger binary must already be running.
 
+    **Session lease**: connecting re-points the shared MCP client at this
+    x64dbg, hijacking sibling lanes' mutating calls (see session_lease). The
+    reply includes an 'Owner' token — echo it on every mutating call you make so
+    they refuse to run after another lane reconnects. No lease protection is
+    possible without the server knowing who is calling, so read-only tools stay
+    pid-anchored instead.
+
     Args:
         x64dbg_path: Path to x64dbg installation (x96dbg.exe, x64dbg.exe, or x32dbg.exe). Falls back to X64DBG_PATH env var if not provided.
         session_pid: PID of the x64dbg process to attach to
+        owner: Lease token this caller asserts (see session_lease).
     """
     if not session_pid:
         return "Error: session_pid is required."
@@ -518,42 +706,60 @@ def connect_to_session(x64dbg_path: str = "", session_pid: int = 0) -> str:
         resolved = _resolve_debugger_path(path)
         _client = X64DbgClient(resolved)
         _client.attach_session(session_pid)
-        return f"Connected to session PID {session_pid}."
+        token = _register_lease(session_pid, owner)
+        return f"Connected to session PID {session_pid}. Owner: {token}."
     except Exception as e:
         _client = None
         return f"Error: {e}"
 
 
 @mcp.tool()
-def connect_remote(host: str, req_rep_port: int, pub_sub_port: int) -> str:
+def connect_remote(host: str, req_rep_port: int, pub_sub_port: int, owner: str = "") -> str:
     """Connect to a remote x64dbg instance running on another machine or VM.
 
     Bypasses local session discovery (lockfiles). The x64dbg plugin on the
     remote machine must be configured to bind to an accessible address
     (e.g. 0.0.0.0) via the [XAutomate] section in x64dbg.ini.
 
+    **Session lease**: connecting re-points the shared MCP client at this remote
+    debugger (see session_lease). The reply includes an 'Owner' token — echo it
+    on every mutating call you make.
+
     Args:
         host: Remote hostname or IP address (e.g. '192.168.1.100')
         req_rep_port: The REQ/REP port the plugin is listening on
         pub_sub_port: The PUB/SUB port the plugin is listening on
+        owner: Lease token this caller asserts (see session_lease).
     """
     global _client
     try:
         _client = X64DbgClient.connect_remote(host, req_rep_port, pub_sub_port)
-        return f"Connected to remote x64dbg at {host}:{req_rep_port}."
+        pid = getattr(_client, "session_pid", 0) or 0
+        token = _register_lease(pid, owner)
+        return f"Connected to remote x64dbg at {host}:{req_rep_port}. Owner: {token}."
     except Exception as e:
         _client = None
         return f"Error: {e}"
 
 
 @mcp.tool()
-def disconnect() -> str:
-    """Disconnect from the current x64dbg session without terminating the debugger."""
+def disconnect(owner: str = "") -> str:
+    """Disconnect from the current x64dbg session without terminating the debugger.
+
+    Disconnecting releases the shared client for every lane. Asserting `owner`
+    (the token your connect/start returned) refuses the disconnect when another
+    lane has since re-connected the shared client onto its own session.
+
+    Args:
+        owner: Lease token this caller asserts (see session_lease).
+    """
     global _client
     if _client is None:
         return "No active connection."
     try:
+        _guard_lease(owner)
         _client.detach_session()
+        _release_lease()
         _client = None
         return "Disconnected."
     except Exception as e:
@@ -562,12 +768,21 @@ def disconnect() -> str:
 
 
 @mcp.tool()
-def terminate_session() -> str:
-    """Terminate the connected x64dbg debugger process."""
+def terminate_session(owner: str = "") -> str:
+    """Terminate the connected x64dbg debugger process.
+
+    Terminating kills the debugger for every lane. Asserting `owner` (the token
+    your connect/start returned) refuses the terminate when another lane has
+    since re-connected the shared client onto its own session.
+
+    Args:
+        owner: Lease token this caller asserts (see session_lease).
+    """
     global _client
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         client.terminate_session()
+        _release_lease()
         _client = None
         return "Session terminated."
     except Exception as e:
@@ -576,7 +791,44 @@ def terminate_session() -> str:
 
 
 @mcp.tool()
-def attach(target: str) -> str:
+def session_lease(owner: str = "") -> str:
+    """Report the current session lease: which debuggee the shared client points at.
+
+    The MCP server is a process singleton shared by every active lane. Every
+    start_session / connect_to_session / connect_remote call re-points the shared
+    client at a new debugger, silently re-targeting other lanes' mutating calls.
+    Run this (read-only, never mutates) to verify:
+
+    - WITHOUT owner: shows 'Session PID: <pid>  Owner: <owner>'.
+    - WITH owner (the token your own connect/start replied with): 'lease OK' when
+      the shared client still points at YOUR session; a SESSION-LEASE-MISMATCH
+      warning + the actual owner when another lane has since re-connected.
+
+    Mutating tools (go/step/trace/run_until/write_memory/set_register/
+    execute_command/set_breakpoint family/hardware_free/assemble/set_label/
+    set_comment/create+terminate+pause_resume+switch_thread/allocate+free_memory/
+    load_executable/attach/set_setting/detach/terminate_debuggee/terminate_session/
+    disconnect) accept the same `owner` argument and refuse to run on a foreign
+    lease. Read-only tools stay safe via per-call pid anchoring in their replies.
+
+    Args:
+        owner: Optional lease token to assert (see above).
+
+    Returns:
+        Lease state, plus 'lease OK' or a mismatch warning when owner is asserted.
+    """
+    try:
+        info = _session_lease_info()
+        if not owner:
+            return info
+        _guard_lease(owner)
+        return f"{info}  lease OK for {owner!r}."
+    except Exception as e:
+        return f"{_session_lease_info()}  {e}"
+
+
+@mcp.tool()
+def attach(target: str, owner: str = "") -> str:
     """Attach the debugger to a running process for live dynamic analysis.
 
     Connects to the target process via dbgeng (WinDbg engine). After attaching,
@@ -585,10 +837,11 @@ def attach(target: str) -> str:
 
     Args:
         target: Process name (e.g. "Game.exe") or PID.
+        owner: Lease token asserted by the caller (see session_lease).
     """
     global _client
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         if isinstance(target, int) or (isinstance(target, str) and target.isdigit()):
             pid = int(target)
         else:
@@ -608,7 +861,7 @@ def attach(target: str) -> str:
 
 
 @mcp.tool()
-def load_executable(target_exe: str, cmdline: str = "", current_dir: str = "") -> str:
+def load_executable(target_exe: str, cmdline: str = "", current_dir: str = "", owner: str = "") -> str:
     """Load a new executable into the debugger.
 
     Imports the file, opens it in the CodeBrowser, and optionally starts auto-analysis.
@@ -618,10 +871,11 @@ def load_executable(target_exe: str, cmdline: str = "", current_dir: str = "") -
         target_exe: Absolute path to the executable file on disk
         cmdline: Command-line arguments for the target (optional)
         current_dir: Working directory for the target (optional)
+        owner: Lease token asserted by the caller (see session_lease).
     """
     global _client
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         success = client.load_executable(target_exe, cmdline, current_dir, wait_timeout=10)
         return f"Loaded {Path(target_exe).name}." if success else f"Failed to load {target_exe}."
     except Exception as e:
@@ -679,15 +933,16 @@ def get_debugger_status() -> str:
 
 
 @mcp.tool()
-def go(pass_exceptions: bool = False, swallow_exceptions: bool = False) -> str:
+def go(pass_exceptions: bool = False, swallow_exceptions: bool = False, owner: str = "") -> str:
     """Resume debuggee execution.
 
     Args:
         pass_exceptions: Pass exceptions to the debuggee
         swallow_exceptions: Swallow exceptions
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         result = client.go(pass_exceptions=pass_exceptions, swallow_exceptions=swallow_exceptions)
         return "Resumed." if result else "Failed to resume."
     except Exception as e:
@@ -695,10 +950,14 @@ def go(pass_exceptions: bool = False, swallow_exceptions: bool = False) -> str:
 
 
 @mcp.tool()
-def pause() -> str:
-    """Pause the debuggee."""
+def pause(owner: str = "") -> str:
+    """Pause the debuggee.
+
+    Args:
+        owner: Lease token asserted by the caller (see session_lease).
+    """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         result = client.pause()
         return "Paused." if result else "Failed to pause."
     except Exception as e:
@@ -706,14 +965,15 @@ def pause() -> str:
 
 
 @mcp.tool()
-def step_into(count: int = 1) -> str:
+def step_into(count: int = 1, owner: str = "") -> str:
     """Step into one or more instructions.
 
     Args:
         count: Number of instructions to step into
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         result = client.stepi(step_count=count)
         return f"Stepped into {count} instruction(s)." if result else "Step into failed."
     except Exception as e:
@@ -721,14 +981,15 @@ def step_into(count: int = 1) -> str:
 
 
 @mcp.tool()
-def step_over(count: int = 1) -> str:
+def step_over(count: int = 1, owner: str = "") -> str:
     """Step over one or more instructions.
 
     Args:
         count: Number of instructions to step over
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         result = client.stepo(step_count=count)
         return f"Stepped over {count} instruction(s)." if result else "Step over failed."
     except Exception as e:
@@ -736,14 +997,15 @@ def step_over(count: int = 1) -> str:
 
 
 @mcp.tool()
-def skip_instruction(count: int = 1) -> str:
+def skip_instruction(count: int = 1, owner: str = "") -> str:
     """Skip instructions without executing them.
 
     Args:
         count: Number of instructions to skip
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         result = client.skip(skip_count=count)
         return f"Skipped {count} instruction(s)." if result else "Skip failed."
     except Exception as e:
@@ -751,14 +1013,15 @@ def skip_instruction(count: int = 1) -> str:
 
 
 @mcp.tool()
-def run_to_return(frames: int = 1) -> str:
+def run_to_return(frames: int = 1, owner: str = "") -> str:
     """Run until a return instruction is encountered.
 
     Args:
         frames: Number of return frames to seek
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         result = client.ret(frames=frames)
         return "Ran to return." if result else "Run to return failed."
     except Exception as e:
@@ -766,13 +1029,16 @@ def run_to_return(frames: int = 1) -> str:
 
 
 @mcp.tool()
-def detach() -> str:
+def detach(owner: str = "") -> str:
     """Detach the debugger from the debuggee without killing it.
 
     The debuggee process continues running normally after detach.
+
+    Args:
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         result = client.detach(wait_timeout=10)
         return "Detached." if result else "Failed to detach."
     except Exception as e:
@@ -780,10 +1046,14 @@ def detach() -> str:
 
 
 @mcp.tool()
-def terminate_debuggee() -> str:
-    """Kill the debuggee process."""
+def terminate_debuggee(owner: str = "") -> str:
+    """Kill the debuggee process.
+
+    Args:
+        owner: Lease token asserted by the caller (see session_lease).
+    """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         result = client.unload_executable(wait_timeout=5)
         return "Debuggee terminated." if result else "Failed to terminate debuggee."
     except Exception as e:
@@ -802,6 +1072,7 @@ def trace_into(
     pass_exceptions: bool = False,
     swallow_exceptions: bool = False,
     wait_timeout: int = 5,
+    owner: str = "",
 ) -> str:
     """Trace into (single-step into calls) until a condition is met.
 
@@ -819,9 +1090,10 @@ def trace_into(
         pass_exceptions: Pass exceptions to the debuggee
         swallow_exceptions: Swallow exceptions
         wait_timeout: Max seconds to wait for trace completion (hard-capped at 5)
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         clamped = wait_timeout > MAX_DEBUGGER_WAIT_SECONDS
         if clamped:
             wait_timeout = MAX_DEBUGGER_WAIT_SECONDS
@@ -855,6 +1127,7 @@ def trace_over(
     pass_exceptions: bool = False,
     swallow_exceptions: bool = False,
     wait_timeout: int = 5,
+    owner: str = "",
 ) -> str:
     """Trace over (single-step over calls) until a condition is met.
 
@@ -872,9 +1145,10 @@ def trace_over(
         pass_exceptions: Pass exceptions to the debuggee
         swallow_exceptions: Swallow exceptions
         wait_timeout: Max seconds to wait for trace completion (hard-capped at 5)
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         clamped = wait_timeout > MAX_DEBUGGER_WAIT_SECONDS
         if clamped:
             wait_timeout = MAX_DEBUGGER_WAIT_SECONDS
@@ -914,7 +1188,7 @@ def _drain_breakpoint_events(client) -> list:
 
 
 @mcp.tool()
-def run_until(condition: str, address: str = "", timeout: int = 5) -> str:
+def run_until(condition: str, address: str = "", timeout: int = 5, owner: str = "") -> str:
     """Run at full speed until a condition holds, then return regs.
 
     Fast alternative to trace_into for far targets: x64dbg has no 'runtocond'
@@ -939,6 +1213,7 @@ def run_until(condition: str, address: str = "", timeout: int = 5) -> str:
             automatically from 'cip == <hex>' / 'eip == <hex>' or a bare hex condition.
         timeout: Max seconds to wait (hard-capped at 5). A condition that never
             becomes true returns TIMEOUT under the cap — never hangs.
+        owner: Lease token asserted by the caller (see session_lease).
 
     Returns:
         On hit: 'Condition met: cip == 0x...' plus 'reason: condition_hit' and the
@@ -948,7 +1223,7 @@ def run_until(condition: str, address: str = "", timeout: int = 5) -> str:
         On timeout: 'TIMEOUT: condition not met within N s' plus the current cip.
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         if not client.is_debugging():
             return NO_DEBUGGEE_MSG
         clamped = timeout > MAX_DEBUGGER_WAIT_SECONDS
@@ -1183,15 +1458,16 @@ def read_memory_many(reads: list[str], format: str = "hex") -> str:
 
 
 @mcp.tool()
-def write_memory(address: str, hex_data: str) -> str:
+def write_memory(address: str, hex_data: str, owner: str = "") -> str:
     """Write bytes to debuggee memory.
 
     Args:
         address: Hex address to write to
         hex_data: Hex string of bytes to write (e.g. '90 90 90' or '909090')
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         addr = _parse_address_or_expression(address)
         cleaned = hex_data.replace(" ", "").replace("\n", "")
         data = bytes.fromhex(cleaned)
@@ -1202,15 +1478,16 @@ def write_memory(address: str, hex_data: str) -> str:
 
 
 @mcp.tool()
-def allocate_memory(size: int = 4096, address: str = "0") -> str:
+def allocate_memory(size: int = 4096, address: str = "0", owner: str = "") -> str:
     """Allocate memory in the debuggee's address space (VirtualAlloc).
 
     Args:
         size: Number of bytes to allocate
         address: Preferred address (0 for any)
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         addr = _parse_address_or_expression(address)
         result = client.virt_alloc(n=size, addr=addr)
         return f"Allocated {size} bytes at {_format_address(result)}."
@@ -1219,14 +1496,15 @@ def allocate_memory(size: int = 4096, address: str = "0") -> str:
 
 
 @mcp.tool()
-def free_memory(address: str) -> str:
+def free_memory(address: str, owner: str = "") -> str:
     """Free memory in the debuggee's address space (VirtualFree).
 
     Args:
         address: Address of memory to free
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         addr = _parse_address_or_expression(address)
         client.virt_free(addr)
         return f"Freed memory at {_format_address(addr)}."
@@ -1553,15 +1831,16 @@ def get_register(register: str) -> str:
 
 
 @mcp.tool()
-def set_register(register: str, value: str) -> str:
+def set_register(register: str, value: str, owner: str = "") -> str:
     """Write a value to a register.
 
     Args:
         register: Register name (e.g. 'rax', 'eip')
         value: Hex value to set
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         val = _parse_address_or_expression(value)
         result = client.set_reg(register, val)
         return f"Set {register} = {_format_address(val)}." if result else "Failed to set register."
@@ -1618,16 +1897,17 @@ def eval_expression(expression: str) -> str:
 
 
 @mcp.tool()
-def execute_command(command: str) -> str:
+def execute_command(command: str, owner: str = "") -> str:
     """Execute a raw x64dbg command.
 
     See https://help.x64dbg.com/en/latest/commands/ for available commands.
 
     Args:
         command: x64dbg command string
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         result = client.cmd_sync(command)
         return f"Command executed. Success: {result}"
     except Exception as e:
@@ -1635,7 +1915,7 @@ def execute_command(command: str) -> str:
 
 
 @mcp.tool()
-def run_command_verified(command: str, verify_expr: str) -> str:
+def run_command_verified(command: str, verify_expr: str, owner: str = "") -> str:
     """Execute a raw x64dbg command, then VERIFY it took effect.
 
     execute_command returns no structured confirmation, and some commands
@@ -1653,6 +1933,7 @@ def run_command_verified(command: str, verify_expr: str) -> str:
         command: x64dbg command string
         verify_expr: x64dbg expression that is non-zero when the command took
             effect (e.g. '[0x401000] == 0x90' after 'fill 0x401000, 2, 90')
+        owner: Lease token asserted by the caller (see session_lease).
 
     Returns:
         On success: '<pid> Command executed. Verified: <verify_expr> = <value>'.
@@ -1661,7 +1942,7 @@ def run_command_verified(command: str, verify_expr: str) -> str:
         (command did not take effect).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         pid = _resolve_anchor_pid(client)
         result = client.cmd_sync(command)
         if not result:
@@ -1869,6 +2150,7 @@ def set_breakpoint(
     memory_mode: str = "a",
     singleshot: bool = False,
     auto_evict: bool = False,
+    owner: str = "",
 ) -> str:
     """Set a breakpoint (software, hardware, or memory).
 
@@ -1890,9 +2172,10 @@ def set_breakpoint(
         auto_evict: Hardware only. When all 4 debug-register slots are occupied,
             evict the oldest DISABLED hardware BP (fallback: lowest occupied slot)
             and reuse its slot, then arm + verify. Default False: fail with detail.
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         # Parse address; if it fails, treat as symbol name
         try:
             addr: int | str = _parse_address_or_expression(address_or_symbol)
@@ -1979,15 +2262,16 @@ def set_breakpoint(
 
 
 @mcp.tool()
-def clear_breakpoint(address: str | None = None, bp_type: str = "software") -> str:
+def clear_breakpoint(address: str | None = None, bp_type: str = "software", owner: str = "") -> str:
     """Clear breakpoint(s).
 
     Args:
         address: Hex address or symbol (None clears all of this type)
         bp_type: 'software', 'hardware', or 'memory'
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         target: int | str | None = None
         if address is not None:
             try:
@@ -2008,16 +2292,17 @@ def clear_breakpoint(address: str | None = None, bp_type: str = "software") -> s
 
 
 @mcp.tool()
-def toggle_breakpoint(address: str | None = None, bp_type: str = "software", enable: bool = True) -> str:
+def toggle_breakpoint(address: str | None = None, bp_type: str = "software", enable: bool = True, owner: str = "") -> str:
     """Enable or disable breakpoint(s).
 
     Args:
         address: Hex address or symbol (None toggles all of this type)
         bp_type: 'software', 'hardware', or 'memory'
         enable: True to enable, False to disable
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         target: int | str | None = None
         if address is not None:
             try:
@@ -2170,7 +2455,7 @@ def _evict_oldest_hardware_slot(client) -> tuple[int | None, object | None, str]
 
 
 @mcp.tool()
-def hardware_free(slot: int) -> str:
+def hardware_free(slot: int, owner: str = "") -> str:
     """Free one hardware-breakpoint debug-register slot (0-3) by number.
 
     Finds the ENABLED hardware BP currently occupying `slot` and clears it
@@ -2181,13 +2466,14 @@ def hardware_free(slot: int) -> str:
 
     Args:
         slot: Debug-register slot index 0-3.
+        owner: Lease token asserted by the caller (see session_lease).
 
     Returns:
         Confirmation of which BP was freed plus the resulting slot map, or an
         error string.
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         if isinstance(slot, bool) or not isinstance(slot, int) or not (0 <= slot <= 3):
             return f"Error: invalid slot {slot!r}: expected an integer 0-3"
         bps = client.get_breakpoints(BreakpointType.BpHardware) or []
@@ -2253,15 +2539,16 @@ def disassemble(address: str, count: int = 10) -> str:
 
 
 @mcp.tool()
-def assemble(address: str, instruction: str) -> str:
+def assemble(address: str, instruction: str, owner: str = "") -> str:
     """Assemble a single instruction at an address.
 
     Args:
         address: Hex address to assemble at
         instruction: Assembly instruction (e.g. 'nop', 'mov eax, 1')
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         addr = _parse_address_or_expression(address)
         size = client.assemble_at(addr, instruction)
         if size is None:
@@ -2276,15 +2563,16 @@ def assemble(address: str, instruction: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def set_label(address: str, text: str) -> str:
+def set_label(address: str, text: str, owner: str = "") -> str:
     """Set a label at an address.
 
     Args:
         address: Hex address
         text: Label text
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         addr = _parse_address_or_expression(address)
         result = client.set_label_at(addr, text)
         return f"Label set at {_format_address(addr)}." if result else "Failed to set label."
@@ -2317,15 +2605,16 @@ def get_label(address: str) -> str:
 
 
 @mcp.tool()
-def set_comment(address: str, text: str) -> str:
+def set_comment(address: str, text: str, owner: str = "") -> str:
     """Set a comment at an address.
 
     Args:
         address: Hex address
         text: Comment text
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         addr = _parse_address_or_expression(address)
         result = client.set_comment_at(addr, text)
         return f"Comment set at {_format_address(addr)}." if result else "Failed to set comment."
@@ -2392,15 +2681,16 @@ def get_symbol(address: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def create_thread(entry_address: str, argument: str = "0") -> str:
+def create_thread(entry_address: str, argument: str = "0", owner: str = "") -> str:
     """Create a new thread in the debuggee.
 
     Args:
         entry_address: Hex address of the thread entry point
         argument: Hex value passed as thread argument
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         addr = _parse_address_or_expression(entry_address)
         arg = _parse_address_or_expression(argument)
         tid = client.thread_create(addr, arg)
@@ -2412,14 +2702,15 @@ def create_thread(entry_address: str, argument: str = "0") -> str:
 
 
 @mcp.tool()
-def terminate_thread(tid: int) -> str:
+def terminate_thread(tid: int, owner: str = "") -> str:
     """Terminate a thread in the debuggee.
 
     Args:
         tid: Thread ID to terminate
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         result = client.thread_terminate(tid)
         return f"Thread {tid} terminated." if result else f"Failed to terminate thread {tid}."
     except Exception as e:
@@ -2427,15 +2718,16 @@ def terminate_thread(tid: int) -> str:
 
 
 @mcp.tool()
-def pause_resume_thread(tid: int, action: str = "pause") -> str:
+def pause_resume_thread(tid: int, action: str = "pause", owner: str = "") -> str:
     """Pause or resume a thread.
 
     Args:
         tid: Thread ID
         action: 'pause' or 'resume'
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         if action == "resume":
             result = client.thread_resume(tid)
             return f"Thread {tid} resumed." if result else f"Failed to resume thread {tid}."
@@ -2447,14 +2739,15 @@ def pause_resume_thread(tid: int, action: str = "pause") -> str:
 
 
 @mcp.tool()
-def switch_thread(tid: int) -> str:
+def switch_thread(tid: int, owner: str = "") -> str:
     """Switch the debugger's active thread context.
 
     Args:
         tid: Thread ID to switch to
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         result = client.switch_thread(tid)
         return f"Switched to thread {tid}." if result else f"Failed to switch to thread {tid}."
     except Exception as e:
@@ -2691,7 +2984,7 @@ def get_setting(section: str, name: str, type: str = "string") -> str:
 
 
 @mcp.tool()
-def set_setting(section: str, name: str, value: str, type: str = "string") -> str:
+def set_setting(section: str, name: str, value: str, type: str = "string", owner: str = "") -> str:
     """Write an x64dbg setting.
 
     Args:
@@ -2699,9 +2992,10 @@ def set_setting(section: str, name: str, value: str, type: str = "string") -> st
         name: Setting name
         value: Setting value
         type: 'string' or 'int'
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         if type == "int":
             result = client.set_setting_int(section, name, int(value))
         else:
@@ -2822,7 +3116,7 @@ def _verify_breakpoint_field(client, bp_type: str, addr: int, attr: str, expecte
 
 
 @mcp.tool()
-def set_breakpoint_condition(address: str, condition: str, bp_type: str = "software") -> str:
+def set_breakpoint_condition(address: str, condition: str, bp_type: str = "software", owner: str = "") -> str:
     """Set a condition on a breakpoint.
 
     With bp_type='hardware' this uses x64dbg's bphwcond (SetHardwareBreakpointCondition)
@@ -2837,9 +3131,10 @@ def set_breakpoint_condition(address: str, condition: str, bp_type: str = "softw
         address: Hex address of the breakpoint
         condition: x64dbg condition expression (e.g. 'eax == 1', '[0x76C30000] == 0x232')
         bp_type: 'software' (default) or 'hardware'
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         addr = _parse_address_or_expression(address)
         if bp_type == "hardware":
             result = client.set_hardware_breakpoint_condition(addr, condition)
@@ -2854,7 +3149,7 @@ def set_breakpoint_condition(address: str, condition: str, bp_type: str = "softw
 
 
 @mcp.tool()
-def set_breakpoint_log(address: str, log_text: str, silent: bool = False, bp_type: str = "software") -> str:
+def set_breakpoint_log(address: str, log_text: str, silent: bool = False, bp_type: str = "software", owner: str = "") -> str:
     """Set log text on a breakpoint.
 
     With bp_type='hardware' this uses x64dbg's bphwlog (SetHardwareBreakpointLog)
@@ -2870,9 +3165,10 @@ def set_breakpoint_log(address: str, log_text: str, silent: bool = False, bp_typ
         log_text: Text to log when the breakpoint is hit
         silent: If True, the breakpoint will not break execution
         bp_type: 'software' (default) or 'hardware'
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         addr = _parse_address_or_expression(address)
         if bp_type == "hardware":
             result = client.set_hardware_breakpoint_log(addr, log_text, silent)
@@ -2887,7 +3183,7 @@ def set_breakpoint_log(address: str, log_text: str, silent: bool = False, bp_typ
 
 
 @mcp.tool()
-def set_breakpoint_command(address: str, command: str, bp_type: str = "software") -> str:
+def set_breakpoint_command(address: str, command: str, bp_type: str = "software", owner: str = "") -> str:
     """Set a command to execute automatically when a breakpoint is hit.
 
     With bp_type='hardware' this uses x64dbg's SetHardwareBreakpointCommand — no
@@ -2901,9 +3197,10 @@ def set_breakpoint_command(address: str, command: str, bp_type: str = "software"
         address: Hex address of the breakpoint
         command: x64dbg command to execute on hit (e.g. 'r al=1' to set al to 1)
         bp_type: 'software' (default) or 'hardware'
+        owner: Lease token asserted by the caller (see session_lease).
     """
     try:
-        client = _require_client()
+        client = _guard_lease(owner)
         addr = _parse_address_or_expression(address)
         if bp_type == "hardware":
             result = client.set_hardware_breakpoint_command(addr, command)
