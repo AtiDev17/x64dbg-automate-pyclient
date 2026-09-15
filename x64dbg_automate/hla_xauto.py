@@ -10,7 +10,7 @@ class XAutoHighLevelCommandAbstractionMixin(XAutoCommandsMixin):
     Higher-level abstractions built on top of raw XAuto command primitives
     """
 
-    def load_executable(self, target_exe: str, cmdline: str = "", current_dir: str = "", wait_timeout: int = 10) -> bool:
+    def load_executable(self, target_exe: str, cmdline: str = "", current_dir: str = "", wait_timeout: int = 10, stop_at_entry: bool = False) -> bool:
         """
         Loads a new executable into the debugger. This method will block until the debugee is ready to receive a command.
 
@@ -33,7 +33,18 @@ class XAutoHighLevelCommandAbstractionMixin(XAutoCommandsMixin):
             target_exe = os.path.abspath(os.path.join(current_dir, target_exe))
         if not self.cmd_sync(f'init "{target_exe}", "{cmdline}", "{current_dir}"'):
             return False
-        return self.wait_cmd_ready(wait_timeout)
+        if not self.wait_cmd_ready(wait_timeout):
+            return False
+        if not stop_at_entry:
+            return True
+        entry, ok = self.eval_sync("mod.entry()")
+        if not ok:
+            return False
+        if not self.set_breakpoint(entry, singleshoot=True):
+            return False
+        if not self.go():
+            return False
+        return self.wait_until_stopped(wait_timeout)
 
     def attach(self, pid: int, wait_timeout: int = 10) -> bool:
         """

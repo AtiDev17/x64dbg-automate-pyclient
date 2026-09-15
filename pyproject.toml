@@ -16,7 +16,7 @@ python = "^3.10"
 pyzmq = "^27.1.0"
 msgpack = "^1.2.1"
 pydantic = "^2.10.6"
-psutil = "^6.1.1"
+psutil = ">=6.1.1,<8.0.0"
 mcp = {version = "^1.28.1", optional = true}
 
 [tool.poetry.extras]

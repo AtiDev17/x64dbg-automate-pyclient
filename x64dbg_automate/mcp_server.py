@@ -367,6 +367,22 @@ def _no_debuggee_hint(client) -> str:
         return ""
 
 
+def _error_json(code: str, detail: str) -> str:
+    return json.dumps({"error": code, "detail": detail}, ensure_ascii=False)
+
+
+def _no_debuggee_error(client) -> str | None:
+    try:
+        if client.is_debugging():
+            return None
+        pid = client.debugee_pid()
+        if isinstance(pid, int) and pid > 0:
+            return _error_json("debuggee_exited", f"Debuggee pid {pid} has exited or terminated.")
+    except Exception:
+        pass
+    return _error_json("no_debuggee", NO_DEBUGGEE_MSG)
+
+
 # Per-call pid anchoring (N1): the MCP holds ONE shared session across lanes, so an
 # in-debugger read can silently land on another lane's debuggee. Every read reply
 # therefore starts with the pid it acted on, resolved per call from the session
@@ -861,7 +877,7 @@ def attach(target: str, owner: str = "") -> str:
 
 
 @mcp.tool()
-def load_executable(target_exe: str, cmdline: str = "", current_dir: str = "", owner: str = "") -> str:
+def load_executable(target_exe: str, cmdline: str = "", current_dir: str = "", stop_at_entry: bool = False, owner: str = "") -> str:
     """Load a new executable into the debugger.
 
     Imports the file, opens it in the CodeBrowser, and optionally starts auto-analysis.
@@ -876,7 +892,7 @@ def load_executable(target_exe: str, cmdline: str = "", current_dir: str = "", o
     global _client
     try:
         client = _guard_lease(owner)
-        success = client.load_executable(target_exe, cmdline, current_dir, wait_timeout=10)
+        success = client.load_executable(target_exe, cmdline, current_dir, wait_timeout=10, stop_at_entry=stop_at_entry)
         return f"Loaded {Path(target_exe).name}." if success else f"Failed to load {target_exe}."
     except Exception as e:
         return f"Error: {e}"
@@ -958,6 +974,9 @@ def pause(owner: str = "") -> str:
     """
     try:
         client = _guard_lease(owner)
+        err = _no_debuggee_error(client)
+        if err:
+            return err
         result = client.pause()
         return "Paused." if result else "Failed to pause."
     except Exception as e:
@@ -1366,7 +1385,10 @@ def read_memory(address: str, size: int = 256, format: str = "dump") -> str:
         try:
             data = client.read_memory(addr, size)
         except Exception as e:
-            return f"Error: {e}{_no_debuggee_hint(client)}"
+            hint = _no_debuggee_hint(client)
+            if hint:
+                return _error_json("no_debuggee", f"{e}{hint}")
+            return f"Error: {e}"
         return f"{pid} @{_format_address(addr)} ({len(data)} bytes): {_encode_memory(data, addr, format)}"
     except Exception as e:
         return f"Error: {e}"
@@ -1859,6 +1881,11 @@ def get_all_registers() -> str:
     """
     try:
         client = _require_client()
+        err = _no_debuggee_error(client)
+        if err:
+            return err
+        if client.is_running():
+            return _error_json("running", "Registers are only meaningful while paused; pause first.")
         pid = _resolve_anchor_pid(client)
         return f"{pid} @registers:\n{_render_registers(client)}"
     except Exception as e:
@@ -1888,6 +1915,12 @@ def eval_expression(expression: str) -> str:
         client = _require_client()
         pid = _resolve_anchor_pid(client)
         _assert_expression_evaluable(client, expression)
+        if client.is_running():
+            return _error_json(
+                "debuggee_running",
+                f"Cannot evaluate '{expression}': the debuggee is running and "
+                "the expression evaluator holds a stale snapshot. Pause first.",
+            )
         val, success = client.eval_sync(expression)
         if not success:
             return f"{pid} Evaluation failed for: {expression}"
@@ -2176,6 +2209,9 @@ def set_breakpoint(
     """
     try:
         client = _guard_lease(owner)
+        err = _no_debuggee_error(client)
+        if err:
+            return err
         # Parse address; if it fails, treat as symbol name
         try:
             addr: int | str = _parse_address_or_expression(address_or_symbol)
@@ -2184,9 +2220,12 @@ def set_breakpoint(
 
         if bp_type == "hardware":
             if hardware_size not in (1, 2, 4, 8):
-                raise ValueError(
-                    f"Invalid hardware_size {hardware_size}: expected 1, 2, 4, or 8 bytes"
+                detail = (
+                    "size must be >= 1"
+                    if hardware_size == 0
+                    else f"Invalid hardware_size {hardware_size}: expected 1, 2, 4, or 8 bytes"
                 )
+                return _error_json("invalid_size", detail)
             hw = HardwareBreakpointType(hardware_mode)
             # auto_evict: when all 4 DRx slots are occupied, evict the oldest
             # DISABLED hardware BP entry (fallback: lowest occupied slot) and
@@ -2241,6 +2280,11 @@ def set_breakpoint(
                     hit = bp
                     break
             if hit is not None:
+                if hit.hwSize < hardware_size:
+                    return _error_json(
+                        "size_downgraded",
+                        f"requested {hardware_size}, set {hit.hwSize} (platform max)",
+                    )
                 return (
                     f"Hardware BP set at {_format_address(hit.addr)} [{hardware_mode}] "
                     f"size={hit.hwSize} confirmed (slot {hit.slot}){evicted_desc}"
@@ -2272,6 +2316,9 @@ def clear_breakpoint(address: str | None = None, bp_type: str = "software", owne
     """
     try:
         client = _guard_lease(owner)
+        err = _no_debuggee_error(client)
+        if err:
+            return err
         target: int | str | None = None
         if address is not None:
             try:
@@ -2303,6 +2350,9 @@ def toggle_breakpoint(address: str | None = None, bp_type: str = "software", ena
     """
     try:
         client = _guard_lease(owner)
+        err = _no_debuggee_error(client)
+        if err:
+            return err
         target: int | str | None = None
         if address is not None:
             try:
@@ -3229,6 +3279,11 @@ def get_stack_trace() -> str:
     """
     try:
         client = _require_client()
+        err = _no_debuggee_error(client)
+        if err:
+            return err
+        if client.is_running():
+            return _error_json("running", "Stack trace is only meaningful while paused; pause first.")
         pid = _resolve_anchor_pid(client)
         frames = client.get_stack_trace()
         if not frames:

@@ -6,10 +6,15 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 from x64dbg_automate.mcp_server import (
+    _bp_census,
+    _clear_all_breakpoints,
     _format_address,
     _format_memory,
+    _guard_lease,
     _parse_address_or_expression,
     _pe_bitness,
+    _register_lease,
+    _release_lease,
     _resolve_debugger_path,
     _resolve_x64dbg_path_with_env,
     _require_client,
@@ -504,11 +509,13 @@ class TestEvalExpressionNoDebuggee:
 
     def test_evaluated_normally_when_debugging(self, mock_client):
         mock_client.is_debugging.return_value = True
+        mock_client.is_running.return_value = False
         mock_client.eval_sync.return_value = (0xDEAD, True)
         assert mcp_mod.eval_expression("[esi+0x10]") == "[esi+0x10] = 0xDEAD"
 
     def test_genuine_failure_still_reported(self, mock_client):
         mock_client.is_debugging.return_value = True
+        mock_client.is_running.return_value = False
         mock_client.eval_sync.return_value = (0, False)
         assert "Evaluation failed" in mcp_mod.eval_expression("[0x1]")
 
@@ -1044,6 +1051,7 @@ class TestGetAllRegisters:
             x87_control_word_fields=x87cw, last_error=(0, ""), last_status=(0, ""),
         )
         mock_client.get_regs.return_value = regdump
+        mock_client.is_running.return_value = False
         result = mcp_mod.get_all_registers()
         assert "rax" in result
         assert "rip" in result
@@ -1056,14 +1064,33 @@ class TestGetAllRegisters:
 
 class TestEvalExpression:
     def test_eval_success(self, mock_client):
+        mock_client.is_running.return_value = False
         mock_client.eval_sync.return_value = (0xBEEF, True)
         result = mcp_mod.eval_expression("kernel32:CreateFileA")
         assert "0xBEEF" in result
 
     def test_eval_failure(self, mock_client):
+        mock_client.is_running.return_value = False
         mock_client.eval_sync.return_value = (0, False)
         result = mcp_mod.eval_expression("bad_expr")
         assert "failed" in result.lower()
+
+
+class TestEvalExpressionRunningGuard:
+    def test_refused_while_running(self, mock_client):
+        mock_client.is_debugging.return_value = True
+        mock_client.is_running.return_value = True
+        result = mcp_mod.eval_expression("eax")
+        assert '"error": "debuggee_running"' in result
+        mock_client.eval_sync.assert_not_called()
+
+    def test_eval_ok_when_paused(self, mock_client):
+        mock_client.is_debugging.return_value = True
+        mock_client.is_running.return_value = False
+        mock_client.eval_sync.return_value = (0x1234, True)
+        result = mcp_mod.eval_expression("eax")
+        assert "0x1234" in result
+        mock_client.eval_sync.assert_called_once()
 
 
 class TestExecuteCommand:
@@ -1640,6 +1667,394 @@ class TestErrorPaths:
         assert "Error" in result
 
     def test_exception_in_eval(self, mock_client):
+        mock_client.is_running.return_value = False
         mock_client.eval_sync.side_effect = Exception("eval failed")
         result = mcp_mod.eval_expression("bad")
         assert "Error" in result
+
+
+# ---------------------------------------------------------------------------
+# Session lease (N2) tests
+# ---------------------------------------------------------------------------
+
+class TestSessionLease:
+    def test_register_lease_with_owner(self):
+        original_pid = mcp_mod._CURRENT_SESSION_PID
+        original_lease = dict(mcp_mod._SESSION_LEASE)
+        try:
+            token = mcp_mod._register_lease(9999, "lane-a")
+            assert token == "lane-a"
+            assert mcp_mod._CURRENT_SESSION_PID == 9999
+            assert mcp_mod._SESSION_LEASE[9999] == "lane-a"
+        finally:
+            mcp_mod._CURRENT_SESSION_PID = original_pid
+            mcp_mod._SESSION_LEASE.clear()
+            mcp_mod._SESSION_LEASE.update(original_lease)
+
+    def test_register_lease_auto_token(self):
+        original_pid = mcp_mod._CURRENT_SESSION_PID
+        original_lease = dict(mcp_mod._SESSION_LEASE)
+        try:
+            token = mcp_mod._register_lease(7777, "")
+            assert token.startswith("auto-")
+            assert mcp_mod._SESSION_LEASE[7777] == token
+        finally:
+            mcp_mod._CURRENT_SESSION_PID = original_pid
+            mcp_mod._SESSION_LEASE.clear()
+            mcp_mod._SESSION_LEASE.update(original_lease)
+
+    def test_release_lease(self):
+        original_pid = mcp_mod._CURRENT_SESSION_PID
+        try:
+            mcp_mod._register_lease(5555, "x")
+            mcp_mod._release_lease()
+            assert mcp_mod._CURRENT_SESSION_PID is None
+        finally:
+            mcp_mod._CURRENT_SESSION_PID = original_pid
+
+    def test_guard_lease_empty_owner_unguarded(self, mock_client):
+        """No owner asserted = legacy unguarded behavior (backwards compatible)."""
+        result = mcp_mod._guard_lease("")
+        assert result is mock_client
+
+    def test_guard_lease_match(self, mock_client):
+        original_pid = mcp_mod._CURRENT_SESSION_PID
+        original_lease = dict(mcp_mod._SESSION_LEASE)
+        try:
+            mcp_mod._register_lease(4242, "owner-1")
+            result = mcp_mod._guard_lease("owner-1")
+            assert result is mock_client
+        finally:
+            mcp_mod._CURRENT_SESSION_PID = original_pid
+            mcp_mod._SESSION_LEASE.clear()
+            mcp_mod._SESSION_LEASE.update(original_lease)
+
+    def test_guard_lease_mismatch_refuses(self, mock_client):
+        """A mutating call asserting another lane's owner must be refused."""
+        original_pid = mcp_mod._CURRENT_SESSION_PID
+        original_lease = dict(mcp_mod._SESSION_LEASE)
+        try:
+            mcp_mod._register_lease(4242, "lane-a")
+            with pytest.raises(RuntimeError, match="SESSION-LEASE-MISMATCH"):
+                mcp_mod._guard_lease("lane-b")
+        finally:
+            mcp_mod._CURRENT_SESSION_PID = original_pid
+            mcp_mod._SESSION_LEASE.clear()
+            mcp_mod._SESSION_LEASE.update(original_lease)
+
+    def test_guard_lease_owner_but_no_lease(self, mock_client):
+        original_pid = mcp_mod._CURRENT_SESSION_PID
+        try:
+            mcp_mod._CURRENT_SESSION_PID = None
+            with pytest.raises(RuntimeError, match="SESSION-LEASE"):
+                mcp_mod._guard_lease("anything")
+        finally:
+            mcp_mod._CURRENT_SESSION_PID = original_pid
+
+    def test_session_lease_tool_no_lease(self, mock_client):
+        original_pid = mcp_mod._CURRENT_SESSION_PID
+        try:
+            mcp_mod._CURRENT_SESSION_PID = None
+            assert "No session lease registered." in mcp_mod.session_lease()
+        finally:
+            mcp_mod._CURRENT_SESSION_PID = original_pid
+
+    def test_session_lease_tool_ok(self, mock_client):
+        original_pid = mcp_mod._CURRENT_SESSION_PID
+        original_lease = dict(mcp_mod._SESSION_LEASE)
+        try:
+            mcp_mod._register_lease(31, "lane-x")
+            out = mcp_mod.session_lease("lane-x")
+            assert "Session PID: 31" in out
+            assert "Owner: lane-x" in out
+            assert "lease OK" in out
+        finally:
+            mcp_mod._CURRENT_SESSION_PID = original_pid
+            mcp_mod._SESSION_LEASE.clear()
+            mcp_mod._SESSION_LEASE.update(original_lease)
+
+    def test_session_lease_tool_mismatch(self, mock_client):
+        original_pid = mcp_mod._CURRENT_SESSION_PID
+        original_lease = dict(mcp_mod._SESSION_LEASE)
+        try:
+            mcp_mod._register_lease(31, "lane-x")
+            out = mcp_mod.session_lease("lane-y")
+            assert "SESSION-LEASE-MISMATCH" in out
+        finally:
+            mcp_mod._CURRENT_SESSION_PID = original_pid
+            mcp_mod._SESSION_LEASE.clear()
+            mcp_mod._SESSION_LEASE.update(original_lease)
+
+
+class TestLeaseGuardedTools:
+    def test_go_refuses_on_foreign_lease(self, mock_client):
+        """go() with another lane's owner must refuse WITHOUT touching the debuggee."""
+        original_pid = mcp_mod._CURRENT_SESSION_PID
+        original_lease = dict(mcp_mod._SESSION_LEASE)
+        try:
+            mcp_mod._register_lease(10, "lane-a")
+            result = mcp_mod.go(owner="lane-b")
+            assert "SESSION-LEASE-MISMATCH" in result
+            mock_client.go.assert_not_called()
+        finally:
+            mcp_mod._CURRENT_SESSION_PID = original_pid
+            mcp_mod._SESSION_LEASE.clear()
+            mcp_mod._SESSION_LEASE.update(original_lease)
+
+    def test_go_passes_on_own_lease(self, mock_client):
+        """go() with the matching owner executes normally."""
+        original_pid = mcp_mod._CURRENT_SESSION_PID
+        original_lease = dict(mcp_mod._SESSION_LEASE)
+        try:
+            mock_client.go.return_value = True
+            mcp_mod._register_lease(10, "lane-a")
+            result = mcp_mod.go(owner="lane-a")
+            assert "Resumed." in result
+            mock_client.go.assert_called_once()
+        finally:
+            mcp_mod._CURRENT_SESSION_PID = original_pid
+            mcp_mod._SESSION_LEASE.clear()
+            mcp_mod._SESSION_LEASE.update(original_lease)
+
+    def test_set_breakpoint_refuses_on_foreign_lease(self, mock_client):
+        original_pid = mcp_mod._CURRENT_SESSION_PID
+        original_lease = dict(mcp_mod._SESSION_LEASE)
+        try:
+            mcp_mod._register_lease(10, "lane-a")
+            result = mcp_mod.set_breakpoint("0x1000", bp_type="software", owner="lane-b")
+            assert "SESSION-LEASE-MISMATCH" in result
+            mock_client.set_breakpoint.assert_not_called()
+        finally:
+            mcp_mod._CURRENT_SESSION_PID = original_pid
+            mcp_mod._SESSION_LEASE.clear()
+            mcp_mod._SESSION_LEASE.update(original_lease)
+
+
+# ---------------------------------------------------------------------------
+# Stale-DB breakpoint census/clear (N1) tests
+# ---------------------------------------------------------------------------
+
+class TestBpCensusClear:
+    def _bp(self):
+        return MagicMock()
+
+    def test_census_counts_by_type(self):
+        client = MagicMock()
+        client.get_breakpoints.side_effect = [[self._bp(), self._bp()], [self._bp()], []]
+        census = _bp_census(client)
+        assert census == {"software": 2, "hardware": 1, "memory": 0}
+
+    def test_census_unavailable_is_minus_one(self):
+        client = MagicMock()
+        client.get_breakpoints.side_effect = RuntimeError("warming up")
+        census = _bp_census(client)
+        assert census == {"software": -1, "hardware": -1, "memory": -1}
+
+    def test_clear_all_counts_successes(self):
+        client = MagicMock()
+        bp_sw = self._bp()
+        bp_hw = self._bp()
+        bp_mem = self._bp()
+        client.get_breakpoints.side_effect = [[bp_sw], [bp_hw], [bp_mem]]
+        client.clear_breakpoint.return_value = True
+        client.clear_hardware_breakpoint.return_value = True
+        client.clear_memory_breakpoint.return_value = False  # failed clears not counted
+        cleared = _clear_all_breakpoints(client)
+        assert cleared == {"software": 1, "hardware": 1, "memory": 0}
+        client.clear_breakpoint.assert_called_once_with(bp_sw.addr)
+        client.clear_hardware_breakpoint.assert_called_once_with(bp_hw.addr)
+        client.clear_memory_breakpoint.assert_called_once_with(bp_mem.addr)
+
+    def test_clear_all_survives_clear_exception(self):
+        client = MagicMock()
+        client.get_breakpoints.side_effect = [[self._bp()], [], []]
+        client.clear_breakpoint.side_effect = RuntimeError("not ready")
+        cleared = _clear_all_breakpoints(client)
+        assert cleared == {"software": 0, "hardware": 0, "memory": 0}
+
+
+class TestStartSessionClearBps:
+    def _run_start(self, mock_client, clear_bps=False):
+        original_client = mcp_mod._client
+        original_pid = mcp_mod._CURRENT_SESSION_PID
+        original_lease = dict(mcp_mod._SESSION_LEASE)
+        try:
+            with patch.object(mcp_mod, "X64DbgClient", return_value=mock_client) as cls, \
+                 patch.object(mcp_mod, "_resolve_x64dbg_path_with_env", return_value="x64dbg.exe"), \
+                 patch.object(mcp_mod, "_resolve_debugger_path", return_value=r"C:\x64dbg.exe"):
+                return mcp_mod.start_session(clear_bps=clear_bps)
+        finally:
+            mcp_mod._client = original_client
+            mcp_mod._CURRENT_SESSION_PID = original_pid
+            mcp_mod._SESSION_LEASE.clear()
+            mcp_mod._SESSION_LEASE.update(original_lease)
+
+    def test_warns_on_restored_bp(self):
+        """Default start_session reports restored stale breakpoints (4-slot HW risk)."""
+        mock_client = MagicMock()
+        mock_client.start_session.return_value = 4242  # x64dbg PID
+        mock_client.get_breakpoints.side_effect = [[MagicMock()], [], []]
+        result = self._run_start(mock_client, clear_bps=False)
+        assert "Owner:" in result
+        assert "Debugger PID: 4242" in result
+        assert "WARNING" in result
+        assert "restored" in result
+
+    def test_clear_bps_clears_and_reports(self):
+        """clear_bps=True clears the restored BPs and reports the count."""
+        mock_client = MagicMock()
+        mock_client.start_session.return_value = 4242
+        mock_client.get_breakpoints.side_effect = [[MagicMock()], [MagicMock()], []]
+        mock_client.clear_breakpoint.return_value = True
+        mock_client.clear_hardware_breakpoint.return_value = True
+        result = self._run_start(mock_client, clear_bps=True)
+        assert "Owner:" in result
+        assert "cleared" in result
+        mock_client.clear_breakpoint.assert_called_once()
+        mock_client.clear_hardware_breakpoint.assert_called_once()
+
+    def test_no_restored_bp_no_warning(self):
+        mock_client = MagicMock()
+        mock_client.start_session.return_value = 4242
+        mock_client.get_breakpoints.side_effect = [[], [], []]
+        result = self._run_start(mock_client, clear_bps=False)
+        assert "Owner:" in result
+        assert "WARNING" not in result
+
+
+class TestLoadExecutableStopAtEntry:
+    def test_stop_at_entry_passthrough(self, mock_client):
+        mock_client.load_executable.return_value = True
+        result = mcp_mod.load_executable("game.exe", current_dir="C:\\game", stop_at_entry=True)
+        mock_client.load_executable.assert_called_once_with(
+            "game.exe", "", "C:\\game", wait_timeout=10, stop_at_entry=True
+        )
+        assert "Loaded game.exe." in result
+
+    def test_default_no_stop_at_entry(self, mock_client):
+        mock_client.load_executable.return_value = True
+        result = mcp_mod.load_executable("game.exe")
+        mock_client.load_executable.assert_called_once_with(
+            "game.exe", "", "", wait_timeout=10, stop_at_entry=False
+        )
+        assert "Loaded game.exe." in result
+
+    def test_failed_load_reported(self, mock_client):
+        mock_client.load_executable.return_value = False
+        result = mcp_mod.load_executable("game.exe")
+        assert "Failed to load" in result
+
+
+class TestStructuredErrorNoDebuggee:
+    def test_pause_no_debuggee(self, mock_client):
+        mock_client.is_debugging.return_value = False
+        mock_client.debugee_pid.return_value = None
+        result = mcp_mod.pause()
+        assert '"error": "no_debuggee"' in result
+        assert "No debuggee" in result
+        mock_client.pause.assert_not_called()
+
+    def test_pause_debuggee_exited(self, mock_client):
+        mock_client.is_debugging.return_value = False
+        mock_client.debugee_pid.return_value = 4321
+        result = mcp_mod.pause()
+        assert '"error": "debuggee_exited"' in result
+        mock_client.pause.assert_not_called()
+
+    def test_set_breakpoint_no_debuggee(self, mock_client):
+        mock_client.is_debugging.return_value = False
+        mock_client.debugee_pid.return_value = None
+        result = mcp_mod.set_breakpoint("0x401000")
+        assert '"error": "no_debuggee"' in result
+        mock_client.set_breakpoint.assert_not_called()
+
+    def test_clear_breakpoint_no_debuggee(self, mock_client):
+        mock_client.is_debugging.return_value = False
+        mock_client.debugee_pid.return_value = None
+        result = mcp_mod.clear_breakpoint()
+        assert '"error": "no_debuggee"' in result
+        mock_client.clear_breakpoint.assert_not_called()
+
+    def test_toggle_breakpoint_no_debuggee(self, mock_client):
+        mock_client.is_debugging.return_value = False
+        mock_client.debugee_pid.return_value = None
+        result = mcp_mod.toggle_breakpoint("0x401000")
+        assert '"error": "no_debuggee"' in result
+
+    def test_get_all_registers_no_debuggee(self, mock_client):
+        mock_client.is_debugging.return_value = False
+        mock_client.debugee_pid.return_value = None
+        result = mcp_mod.get_all_registers()
+        assert '"error": "no_debuggee"' in result
+        mock_client.get_regs.assert_not_called()
+
+    def test_get_stack_trace_no_debuggee(self, mock_client):
+        mock_client.is_debugging.return_value = False
+        mock_client.debugee_pid.return_value = None
+        result = mcp_mod.get_stack_trace()
+        assert '"error": "no_debuggee"' in result
+        mock_client.get_stack_trace.assert_not_called()
+
+    def test_get_all_registers_running(self, mock_client):
+        mock_client.is_debugging.return_value = True
+        mock_client.is_running.return_value = True
+        result = mcp_mod.get_all_registers()
+        assert '"error": "running"' in result
+        mock_client.get_regs.assert_not_called()
+
+    def test_get_stack_trace_running(self, mock_client):
+        mock_client.is_debugging.return_value = True
+        mock_client.is_running.return_value = True
+        result = mcp_mod.get_stack_trace()
+        assert '"error": "running"' in result
+        mock_client.get_stack_trace.assert_not_called()
+
+    def test_read_memory_failure_structured(self, mock_client):
+        mock_client.is_debugging.return_value = False
+        mock_client.debugee_pid.return_value = None
+        mock_client.read_memory.side_effect = RuntimeError("XERROR_READ_FAILED")
+        result = mcp_mod.read_memory("0x10000", 16)
+        assert '"error": "no_debuggee"' in result
+        assert "XERROR_READ_FAILED" in result
+
+
+class TestHardwareBreakpointSize:
+    def test_size_zero_rejected(self, mock_client):
+        result = mcp_mod.set_breakpoint("0x401000", bp_type="hardware", hardware_size=0)
+        assert '"error": "invalid_size"' in result
+        assert "size must be >= 1" in result
+        mock_client.set_hardware_breakpoint.assert_not_called()
+
+    def test_size_non_power_of_two_rejected(self, mock_client):
+        result = mcp_mod.set_breakpoint("0x401000", bp_type="hardware", hardware_size=3)
+        assert '"error": "invalid_size"' in result
+        assert "Invalid hardware_size" in result
+        mock_client.set_hardware_breakpoint.assert_not_called()
+
+    def test_size_downgrade_detected(self, mock_client):
+        mock_client.set_hardware_breakpoint.return_value = True
+        hw = Breakpoint(
+            type=BreakpointType.BpHardware, addr=0x401000, enabled=True, singleshoot=False,
+            active=True, name="hw_watch", mod="game.exe", slot=1, typeEx=1, hwSize=2,
+            hitCount=0, fastResume=False, silent=False, breakCondition="", logText="",
+            logCondition="", commandText="", commandCondition="",
+        )
+        mock_client.get_breakpoints.return_value = [hw]
+        result = mcp_mod.set_breakpoint("0x401000", bp_type="hardware", hardware_mode="w",
+                                        hardware_size=4)
+        assert '"error": "size_downgraded"' in result
+        assert "requested 4, set 2" in result
+
+    def test_same_size_no_downgrade(self, mock_client):
+        mock_client.set_hardware_breakpoint.return_value = True
+        hw = Breakpoint(
+            type=BreakpointType.BpHardware, addr=0x401000, enabled=True, singleshoot=False,
+            active=True, name="hw_watch", mod="game.exe", slot=1, typeEx=1, hwSize=4,
+            hitCount=0, fastResume=False, silent=False, breakCondition="", logText="",
+            logCondition="", commandText="", commandCondition="",
+        )
+        mock_client.get_breakpoints.return_value = [hw]
+        result = mcp_mod.set_breakpoint("0x401000", bp_type="hardware", hardware_mode="w",
+                                        hardware_size=4)
+        assert "confirmed (slot 1)" in result
+        assert "size=4" in result
