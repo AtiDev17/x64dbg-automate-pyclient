@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 from x64dbg_automate.mcp_server import (
     _bp_census,
     _clear_all_breakpoints,
+    _debugger_arch_label,
     _format_address,
     _format_memory,
     _guard_lease,
@@ -15,6 +16,7 @@ from x64dbg_automate.mcp_server import (
     _pe_bitness,
     _register_lease,
     _release_lease,
+    _resolve_arch_bitness,
     _resolve_debugger_path,
     _resolve_x64dbg_path_with_env,
     _require_client,
@@ -209,22 +211,86 @@ class TestResolveDebuggerPath:
         result = _resolve_debugger_path(str(launcher), str(target))
         assert result == str(dbg)
 
-    def test_x96dbg_no_target_defaults_64(self, tmp_path):
-        """No target exe defaults to 64-bit."""
+    def test_x96dbg_no_target_no_arch_errors(self, tmp_path):
+        """Launcher without target or arch fails loudly instead of defaulting to 64-bit (P12)."""
+        launcher = tmp_path / "x96dbg.exe"
+        launcher.write_bytes(b"")
+        x64_dir = tmp_path / "x64"
+        x64_dir.mkdir()
+        (x64_dir / "x64dbg.exe").write_bytes(b"")
+        with pytest.raises(ValueError, match="X64DBG_ARCH"):
+            _resolve_debugger_path(str(launcher))
+
+    def test_x96dbg_arch_param_x32(self, tmp_path):
+        """arch='x32' + no target -> x32/x32dbg.exe (no silent x64 default)."""
+        launcher = tmp_path / "x96dbg.exe"
+        launcher.write_bytes(b"")
+        x32_dir = tmp_path / "x32"
+        x32_dir.mkdir()
+        dbg = x32_dir / "x32dbg.exe"
+        dbg.write_bytes(b"")
+        result = _resolve_debugger_path(str(launcher), "", "x32")
+        assert result == str(dbg)
+
+    def test_x96dbg_arch_param_overrides_target(self, tmp_path):
+        """arch='x64' wins over a 32-bit target PE."""
         launcher = tmp_path / "x96dbg.exe"
         launcher.write_bytes(b"")
         x64_dir = tmp_path / "x64"
         x64_dir.mkdir()
         dbg = x64_dir / "x64dbg.exe"
         dbg.write_bytes(b"")
+        target = tmp_path / "target.exe"
+        target.write_bytes(_make_minimal_pe(0x14C))
+        result = _resolve_debugger_path(str(launcher), str(target), "x64")
+        assert result == str(dbg)
+
+    def test_x96dbg_arch_env_x32(self, tmp_path, monkeypatch):
+        """X64DBG_ARCH env selects x32 when no arch param or target."""
+        monkeypatch.setenv("X64DBG_ARCH", "x32")
+        launcher = tmp_path / "x96dbg.exe"
+        launcher.write_bytes(b"")
+        x32_dir = tmp_path / "x32"
+        x32_dir.mkdir()
+        dbg = x32_dir / "x32dbg.exe"
+        dbg.write_bytes(b"")
         result = _resolve_debugger_path(str(launcher))
         assert result == str(dbg)
+
+    def test_x96dbg_invalid_arch_errors(self, tmp_path):
+        launcher = tmp_path / "x96dbg.exe"
+        launcher.write_bytes(b"")
+        with pytest.raises(ValueError, match="Invalid arch"):
+            _resolve_debugger_path(str(launcher), "", "arm64")
 
     def test_x96dbg_not_found(self, tmp_path):
         launcher = tmp_path / "x96dbg.exe"
         launcher.write_bytes(b"")
         with pytest.raises(FileNotFoundError, match="Cannot find"):
-            _resolve_debugger_path(str(launcher))
+            _resolve_debugger_path(str(launcher), "", "x64")
+
+
+class TestResolveArchBitness:
+    def test_arch_param_priority(self, monkeypatch):
+        monkeypatch.setenv("X64DBG_ARCH", "x32")
+        assert _resolve_arch_bitness("x64", "") == 64
+        assert _resolve_arch_bitness("", "") == 32
+
+    def test_target_pe_when_auto(self, tmp_path):
+        target = tmp_path / "t.exe"
+        target.write_bytes(_make_minimal_pe(0x14C))
+        assert _resolve_arch_bitness("", str(target)) == 32
+
+    def test_no_target_no_arch_errors(self):
+        with pytest.raises(ValueError, match="X64DBG_ARCH"):
+            _resolve_arch_bitness("", "")
+
+
+class TestDebuggerArchLabel:
+    def test_labels(self):
+        assert _debugger_arch_label("C:\\x\\x32dbg.exe") == "x32"
+        assert _debugger_arch_label("C:\\x\\x64dbg.exe") == "x64"
+        assert _debugger_arch_label("C:\\x\\release\\x32\\x32dbg.exe") == "x32"
 
 
 class TestResolveX64dbgPathWithEnv:
@@ -380,7 +446,7 @@ class TestStartSession:
         mock_instance.start_session.return_value = 1234
         mock_cls.return_value = mock_instance
         result = mcp_mod.start_session(x64dbg_path="C:\\x64dbg\\x96dbg.exe")
-        mock_resolve.assert_called_once_with("C:\\x64dbg\\x96dbg.exe", "")
+        mock_resolve.assert_called_once_with("C:\\x64dbg\\x96dbg.exe", "", "")
         assert "1234" in result
 
     @patch.object(mcp_mod, "X64DbgClient")
@@ -391,7 +457,7 @@ class TestStartSession:
         mock_instance.start_session.return_value = 5678
         mock_cls.return_value = mock_instance
         result = mcp_mod.start_session()
-        mock_resolve.assert_called_once_with("C:\\env\\x96dbg.exe", "")
+        mock_resolve.assert_called_once_with("C:\\env\\x96dbg.exe", "", "")
         assert "5678" in result
 
     def test_no_path_no_env_error(self, monkeypatch):
@@ -408,7 +474,7 @@ class TestConnectToSession:
         mock_instance = MagicMock()
         mock_cls.return_value = mock_instance
         result = mcp_mod.connect_to_session(x64dbg_path="C:\\x64dbg\\x96dbg.exe", session_pid=1234)
-        mock_resolve.assert_called_once_with("C:\\x64dbg\\x96dbg.exe")
+        mock_resolve.assert_called_once_with("C:\\x64dbg\\x96dbg.exe", "", "")
         assert "1234" in result
 
     @patch.object(mcp_mod, "X64DbgClient")
@@ -418,7 +484,7 @@ class TestConnectToSession:
         mock_instance = MagicMock()
         mock_cls.return_value = mock_instance
         result = mcp_mod.connect_to_session(session_pid=5678)
-        mock_resolve.assert_called_once_with("C:\\env\\x96dbg.exe")
+        mock_resolve.assert_called_once_with("C:\\env\\x96dbg.exe", "", "")
         assert "5678" in result
 
     def test_no_path_no_env_error(self, monkeypatch):

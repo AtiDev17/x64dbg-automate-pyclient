@@ -565,20 +565,42 @@ def _resolve_x64dbg_path_with_env(x64dbg_path: str) -> str:
     return path
 
 
-def _resolve_debugger_path(x64dbg_path: str, target_exe: str = "") -> str:
-    """Resolve x96dbg.exe to the correct x64dbg.exe or x32dbg.exe based on target bitness.
+def _resolve_arch_bitness(arch: str = "", target_exe: str = "") -> int:
+    """Pick 64/32 for a launcher: arch param > X64DBG_ARCH env > target PE bitness > error."""
+    a = (arch or "").strip().lower()
+    if not a:
+        a = os.environ.get("X64DBG_ARCH", "").strip().lower()
+    if a in ("64", "x64", "amd64", "x86_64"):
+        return 64
+    if a in ("32", "x32", "x86", "i386"):
+        return 32
+    if a:
+        raise ValueError(f"Invalid arch {arch!r}: use 'x64' or 'x32'.")
+    if target_exe.strip():
+        return _pe_bitness(target_exe.strip())
+    raise ValueError(
+        "Cannot pick x64 vs x32: no target executable, no arch parameter, and "
+        "no X64DBG_ARCH env var. Pass arch='x64'/'x32' or set X64DBG_ARCH."
+    )
+
+
+def _debugger_arch_label(path: str) -> str:
+    """'x32'/'x64' from a resolved debugger binary name (reply echo only)."""
+    return "x32" if "x32dbg" in Path(path).name.lower() else "x64"
+
+
+def _resolve_debugger_path(x64dbg_path: str, target_exe: str = "", arch: str = "") -> str:
+    """Resolve x96dbg.exe to x64dbg.exe or x32dbg.exe.
 
     If the path already points to x64dbg.exe or x32dbg.exe, it is returned as-is.
+    The launcher is resolved via _resolve_arch_bitness — never a silent 64-bit default.
     """
     p = Path(x64dbg_path)
     name_lower = p.name.lower()
     if name_lower not in ("x96dbg.exe", "x96dbg"):
         return x64dbg_path
     # x96dbg launcher — resolve to the correct binary
-    if target_exe.strip():
-        bitness = _pe_bitness(target_exe.strip())
-    else:
-        bitness = 64  # default when no target specified
+    bitness = _resolve_arch_bitness(arch, target_exe)
     arch_dir = "x64" if bitness == 64 else "x32"
     dbg_name = "x64dbg.exe" if bitness == 64 else "x32dbg.exe"
     candidates = [
@@ -621,11 +643,14 @@ def list_sessions() -> str:
 
 @mcp.tool()
 def start_session(x64dbg_path: str = "", target_exe: str = "", cmdline: str = "",
-                  current_dir: str = "", clear_bps: bool = False, owner: str = "") -> str:
+                  current_dir: str = "", clear_bps: bool = False, owner: str = "",
+                  arch: str = "") -> str:
     """Launch a new x64dbg instance and optionally load an executable.
 
     If x96dbg.exe (the launcher) is given, the correct x64dbg.exe or x32dbg.exe is
-    selected automatically based on the target executable's PE bitness.
+    selected automatically: explicit arch='x64'/'x32' wins, then the X64DBG_ARCH
+    env var, then the target executable's PE bitness. With no target AND no arch
+    the launcher request fails loudly instead of defaulting to x64.
 
     **Stale-DB breakpoints**: x64dbg restores the previous session's *.db32 on
     launch, which can silently re-arm breakpoints (including hardware BPs that
@@ -646,11 +671,13 @@ def start_session(x64dbg_path: str = "", target_exe: str = "", cmdline: str = ""
         clear_bps: Clear any breakpoints restored from the previous session's DB
             right after connect (best-effort; hardware clears may need a debuggee).
         owner: Lease token this caller asserts (see session_lease).
+        arch: 'x64' or 'x32' to force a bitness for the x96dbg launcher; overrides
+            X64DBG_ARCH and target PE bitness (default: auto).
     """
     global _client
     try:
         path = _resolve_x64dbg_path_with_env(x64dbg_path)
-        resolved = _resolve_debugger_path(path, target_exe)
+        resolved = _resolve_debugger_path(path, target_exe, arch)
         _client = X64DbgClient(resolved)
         pid = _client.start_session(target_exe, cmdline, current_dir)
         token = _register_lease(pid, owner)
@@ -687,8 +714,8 @@ def start_session(x64dbg_path: str = "", target_exe: str = "", cmdline: str = ""
                     )
         tail = " ".join(notes)
         return (
-            f"Session started with {Path(resolved).name}. Debugger PID: {pid} "
-            f"Owner: {token}." + (f" {tail}" if tail else "")
+            f"Session started with {Path(resolved).name} ({_debugger_arch_label(resolved)}). "
+            f"Debugger PID: {pid} Owner: {token}." + (f" {tail}" if tail else "")
         )
     except Exception as e:
         _client = None
@@ -696,10 +723,13 @@ def start_session(x64dbg_path: str = "", target_exe: str = "", cmdline: str = ""
 
 
 @mcp.tool()
-def connect_to_session(x64dbg_path: str = "", session_pid: int = 0, owner: str = "") -> str:
+def connect_to_session(x64dbg_path: str = "", session_pid: int = 0, owner: str = "",
+                       arch: str = "") -> str:
     """Connect to an already-running x64dbg instance.
 
-    If x96dbg.exe is given, it is resolved to x64dbg.exe (default).
+    If x96dbg.exe is given, it is resolved to x64dbg.exe or x32dbg.exe per the
+    arch selection rules (explicit arch > X64DBG_ARCH env > error — no silent
+    x64 default, and there is no target exe to probe here).
     The actual debugger binary must already be running.
 
     **Session lease**: connecting re-points the shared MCP client at this
@@ -713,17 +743,21 @@ def connect_to_session(x64dbg_path: str = "", session_pid: int = 0, owner: str =
         x64dbg_path: Path to x64dbg installation (x96dbg.exe, x64dbg.exe, or x32dbg.exe). Falls back to X64DBG_PATH env var if not provided.
         session_pid: PID of the x64dbg process to attach to
         owner: Lease token this caller asserts (see session_lease).
+        arch: 'x64' or 'x32' to force a bitness for the x96dbg launcher (default: auto/X64DBG_ARCH).
     """
     if not session_pid:
         return "Error: session_pid is required."
     global _client
     try:
         path = _resolve_x64dbg_path_with_env(x64dbg_path)
-        resolved = _resolve_debugger_path(path)
+        resolved = _resolve_debugger_path(path, "", arch)
         _client = X64DbgClient(resolved)
         _client.attach_session(session_pid)
         token = _register_lease(session_pid, owner)
-        return f"Connected to session PID {session_pid}. Owner: {token}."
+        return (
+            f"Connected to session PID {session_pid} "
+            f"({_debugger_arch_label(resolved)}). Owner: {token}."
+        )
     except Exception as e:
         _client = None
         return f"Error: {e}"
